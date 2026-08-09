@@ -73,6 +73,95 @@ public interface InputBackend extends AutoCloseable {
         return down;
     }
 
+    // ---- Window attachment, focus and coordinate conversion --------------
+    //
+    // Default implementations make these features opt-in: a backend that has not implemented window
+    // integration behaves as a windowless, always-focused, screen-space device. The Windows backend
+    // overrides them; macOS/Linux inherit the defaults until implemented.
+
+    /**
+     * Bind to a host-created window for focus gating and client-relative coordinates.
+     *
+     * @throws BackendException if the window kind is not supported by this backend
+     * @throws UnsupportedOperationException if this backend has no window integration
+     */
+    default void attach(NativeWindow window) throws BackendException {
+        throw new UnsupportedOperationException(name() + " does not support window attachment yet");
+    }
+
+    /** Release a previously attached window. No-op if none attached. */
+    default void detach() {
+        // no-op by default
+    }
+
+    /** @return whether a window is currently attached. */
+    default boolean isWindowAttached() {
+        return false;
+    }
+
+    /**
+     * @return whether the attached window currently holds input focus. Windowless backends report
+     *         {@code true} (nothing to gate against).
+     */
+    default boolean isFocused() {
+        return true;
+    }
+
+    /**
+     * Convert a screen-space point to the attached window's client area.
+     *
+     * @return the converted point as {@code [clientX, clientY]}; identity if no window is attached
+     */
+    default int[] toClient(int screenX, int screenY) {
+        return new int[] {screenX, screenY};
+    }
+
+    // ---- Pointer lock (relative motion / mouselook) ----------------------
+
+    /** @return whether this backend can capture the pointer for relative motion. */
+    default boolean supportsPointerLock() {
+        return false;
+    }
+
+    /**
+     * Capture the pointer in the given mode and hide the cursor. Idempotent; changing mode while
+     * locked is allowed.
+     *
+     * @throws UnsupportedOperationException if {@link #supportsPointerLock()} is false
+     */
+    default void setPointerLock(PointerLockMode mode) throws BackendException {
+        throw new UnsupportedOperationException(name() + " does not support pointer lock");
+    }
+
+    /** Release the pointer and restore the cursor. No-op if not locked. */
+    default void clearPointerLock() {
+        // no-op by default
+    }
+
+    /** @return whether the pointer is currently locked. */
+    default boolean isPointerLocked() {
+        return false;
+    }
+
+    /**
+     * Drain accumulated relative pointer motion since the last call, resetting the accumulator.
+     * Meaningful while locked; returns {@link PointerDelta#ZERO} otherwise.
+     */
+    default PointerDelta drainPointerDelta() {
+        return PointerDelta.ZERO;
+    }
+
+    // ---- Scroll ----------------------------------------------------------
+
+    /**
+     * Drain accumulated scroll-wheel motion since the last call, resetting the accumulator. A
+     * backend that is not an event source (no wheel plumbing) always returns
+     * {@link ScrollDelta#ZERO}.
+     */
+    default ScrollDelta drainScroll() {
+        return ScrollDelta.ZERO;
+    }
+
     /** Release native resources. Idempotent. */
     @Override
     void close();

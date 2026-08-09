@@ -16,6 +16,8 @@ package sibarum.tactroller.api;
  *     case InputEvent.PointerMoved m   -> ...
  *     case InputEvent.ButtonPressed b  -> ...
  *     case InputEvent.ButtonReleased b -> ...
+ *     case InputEvent.Scrolled s       -> ...
+ *     case InputEvent.FocusChanged f   -> ...
  * }
  * }</pre>
  */
@@ -48,4 +50,22 @@ public sealed interface InputEvent {
 
     /** A mouse button transitioned from down to up, with the pointer position at that moment. */
     record ButtonReleased(MouseButton button, int x, int y, long timestampNanos) implements InputEvent {}
+
+    /**
+     * The scroll wheel moved.
+     *
+     * @param xOffset horizontal scroll in notches (right positive)
+     * @param yOffset vertical scroll in notches (up/away positive, GLFW convention)
+     * @param x       pointer position when the scroll occurred
+     * @param y       pointer position when the scroll occurred
+     */
+    record Scrolled(double xOffset, double yOffset, int x, int y, long timestampNanos) implements InputEvent {}
+
+    /**
+     * The attached window gained or lost input focus. Only emitted when a window is attached via
+     * {@link Tactroller#attach(NativeWindow)}.
+     *
+     * @param focused {@code true} if the window is now focused
+     */
+    record FocusChanged(boolean focused, long timestampNanos) implements InputEvent {}
 }

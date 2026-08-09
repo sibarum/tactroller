@@ -69,6 +69,38 @@ try (Tactroller t = Tactroller.open()) {
 }                       // close() stops the loop and releases native resources
 ```
 
+### Mouselook, scroll, window & focus
+
+```java
+try (Tactroller t = Tactroller.open()) {
+    t.attach(NativeWindow.ofHwnd(hwnd));          // focus gating + client coords
+    t.setCoordinateSpace(CoordinateSpace.CLIENT); // event/poll coords relative to client area
+
+    // Mouselook — two modes, pick per your needs:
+    t.lockPointer(PointerLockMode.RAW);           // raw device deltas (no accel, no edge clip)
+    // t.lockPointer(PointerLockMode.RECENTER);   // hide + warp-to-center each drain
+
+    while (running) {                              // per frame
+        PointerDelta look = t.pollPointerDelta();  // relative motion since last frame
+        ScrollDelta wheel = t.pollScroll();        // notches since last frame
+    }
+    t.unlockPointer();
+}
+```
+
+| Concern | API | Windows implementation |
+|---------|-----|------------------------|
+| Relative mouse / pointer-lock | `lockPointer(RAW\|RECENTER)`, `pollPointerDelta()` | RawInput deltas, or hide + `SetCursorPos` recenter |
+| Scroll wheel | `pollScroll()`, `InputEvent.Scrolled` | RawInput `WM_INPUT` wheel notches |
+| Window-relative coords | `attach()`, `setCoordinateSpace(CLIENT)` | `ScreenToClient` |
+| Focus gating | `setFocusGated(true)`, `InputEvent.FocusChanged` | `GetForegroundWindow` |
+
+Scroll and RAW pointer-lock are served by a **message-only window registered for RawInput** on a
+dedicated pump thread; its `WndProc` (an FFM upcall) only *accumulates* into atomic counters, which
+the shared event loop drains — so events still come from one place (see below). macOS and Linux
+expose the identical API and inherit safe defaults (no scroll, lock unsupported) until their native
+plumbing lands. Text/character + IME events are not yet implemented.
+
 ### How events stay identical across OSes
 
 The event loop lives in `tactroller-api`, not in the platform backends. It samples the backend
