@@ -125,7 +125,7 @@ public final class MacosInputBackend implements InputBackend {
     public boolean isKeyDown(Key key) throws BackendException {
         Integer code = keyCodeByKey.get(key);
         if (code == null) {
-            throw new BackendException("Key not mapped for macOS: " + key);
+            return false; // unobservable key reported as not-down (keeps pollKeys robust)
         }
         try {
             return (boolean) cgEventSourceKeyState.invokeExact(COMBINED_SESSION_STATE, code.shortValue());

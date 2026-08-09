@@ -39,9 +39,24 @@ import java.util.function.Consumer;
  * {@link InputEvent}s. That derivation is the same code on every OS, so the event stream is
  * identical regardless of the native backend underneath.
  *
- * <p><b>Draining:</b> {@link #pollPointerDelta()}/{@link #pollScroll()} and the running event loop
- * both consume the backend's relative-motion and scroll accumulators. Use one or the other for a
- * given signal; mixing them splits the stream between consumers.
+ * <p><b>Draining:</b> {@link #pollPointerDelta()}/{@link #pollScroll()}/{@link #snapshot()} and the
+ * running event loop all consume the backend's relative-motion and scroll accumulators. Use one or
+ * the other for a given signal; mixing them splits the stream between consumers.
+ *
+ * <h2>Thread-affinity contract</h2>
+ * <ul>
+ *   <li>The backend owns any native event source (on Windows, a message-only RawInput window on its
+ *       own pump thread); it does <b>not</b> require the embedding application's window or its event
+ *       pump to be running, and it registers RawInput against its own window, not the app's HWND.</li>
+ *   <li>Relative-motion and scroll accumulators are updated on that pump thread and drained via
+ *       atomic swaps, so it is safe to drain them from a different thread than the one filling them.</li>
+ *   <li><b>Recommended for an engine with its own render loop (e.g. a first-person view):</b> do not
+ *       call {@link #start()}. Instead call {@link #snapshot()} (or the {@code poll*} methods) once
+ *       per frame on the render thread. This keeps produce-and-consume on one thread and gives edges
+ *       for free.</li>
+ *   <li>{@link #start()} spins a separate daemon that samples at a fixed rate — use it for
+ *       retained-mode/event-driven consumers, not alongside per-frame polling of the same signals.</li>
+ * </ul>
  */
 public final class Tactroller implements AutoCloseable {
 
@@ -63,6 +78,13 @@ public final class Tactroller implements AutoCloseable {
     private boolean pollDeltaPrimed;
     private int pollDeltaX;
     private int pollDeltaY;
+
+    // Baseline for snapshot() edge diffing (render-thread polling path).
+    private boolean snapPrimed;
+    private Set<Key> snapPrevKeys = Set.of();
+    private Set<MouseButton> snapPrevButtons = Set.of();
+    private int snapPrevX;
+    private int snapPrevY;
 
     private Tactroller(InputBackend backend) {
         this.backend = backend;
@@ -115,6 +137,21 @@ public final class Tactroller implements AutoCloseable {
         return backend.isKeyDown(key);
     }
 
+    /** @return whether {@code button} is currently held down (allocation-free on supporting backends). */
+    public boolean isButtonDown(MouseButton button) throws BackendException {
+        return backend.isButtonDown(button);
+    }
+
+    /** @return the currently active keyboard modifiers. */
+    public Set<Modifier> modifiers() throws BackendException {
+        return Modifier.from(backend.pollKeys());
+    }
+
+    /** @return the attached window's content scale (1.0 at 100% DPI, 1.5 at 150%); 1.0 if detached. */
+    public double contentScale() {
+        return backend.contentScale();
+    }
+
     /**
      * Drain relative pointer motion since the last call. While the pointer is locked this is the
      * backend's captured device/recenter delta; while unlocked it is the change in absolute
@@ -140,6 +177,62 @@ public final class Tactroller implements AutoCloseable {
     /** Drain scroll-wheel motion since the last call. */
     public ScrollDelta pollScroll() {
         return backend.drainScroll();
+    }
+
+    /**
+     * Capture an immutable {@link InputFrame} for this frame: held keys/buttons/modifiers, the
+     * pressed/released edges since the previous snapshot, relative motion, scroll, focus and pointer
+     * position (in the configured {@link CoordinateSpace}).
+     *
+     * <p>This is the render-thread polling path: call it once per frame from a single thread. It
+     * drains the relative-motion and scroll accumulators, so — as with {@link #pollPointerDelta()}
+     * / {@link #pollScroll()} — do not also run the event loop for the same signals. The first
+     * snapshot reports no edges (it establishes the baseline).
+     */
+    public synchronized InputFrame snapshot() throws BackendException {
+        boolean focused = backend.isFocused();
+        ScrollDelta scroll = backend.drainScroll();
+        PointerState p = backend.pollPointer();
+        Set<Key> keys = backend.pollKeys();
+        Set<MouseButton> buttons = p.buttons();
+        int[] xy = project(p.x(), p.y());
+        long now = System.nanoTime();
+
+        PointerDelta motion;
+        if (backend.isPointerLocked()) {
+            motion = backend.drainPointerDelta();
+        } else if (snapPrimed) {
+            motion = new PointerDelta(xy[0] - snapPrevX, xy[1] - snapPrevY);
+        } else {
+            motion = PointerDelta.ZERO;
+        }
+
+        Set<Key> pressedKeys = snapPrimed ? minus(keys, snapPrevKeys) : Set.of();
+        Set<Key> releasedKeys = snapPrimed ? minus(snapPrevKeys, keys) : Set.of();
+        Set<MouseButton> pressedBtn = snapPrimed ? minus(buttons, snapPrevButtons) : Set.of();
+        Set<MouseButton> releasedBtn = snapPrimed ? minus(snapPrevButtons, buttons) : Set.of();
+
+        InputFrame frame = new InputFrame(
+                keys, pressedKeys, releasedKeys,
+                buttons, pressedBtn, releasedBtn,
+                Modifier.from(keys),
+                xy[0], xy[1], motion, scroll, focused, now);
+
+        snapPrevKeys = keys;
+        snapPrevButtons = buttons;
+        snapPrevX = xy[0];
+        snapPrevY = xy[1];
+        snapPrimed = true;
+        return frame;
+    }
+
+    private static <T extends Enum<T>> Set<T> minus(Set<T> a, Set<T> b) {
+        if (a.isEmpty()) {
+            return Set.of();
+        }
+        java.util.EnumSet<T> r = java.util.EnumSet.copyOf(a);
+        r.removeAll(b);
+        return r;
     }
 
     // ---- Window attachment, focus, coordinate space ----------------------
@@ -317,18 +410,26 @@ public final class Tactroller implements AutoCloseable {
 
     /** Project a screen point into the configured coordinate space (falls back to screen if detached). */
     private int[] project(int screenX, int screenY) {
-        if (coordinateSpace == CoordinateSpace.CLIENT && backend.isWindowAttached()) {
-            return backend.toClient(screenX, screenY);
+        if (!backend.isWindowAttached()) {
+            return new int[] {screenX, screenY};
         }
-        return new int[] {screenX, screenY};
+        return switch (coordinateSpace) {
+            case SCREEN -> new int[] {screenX, screenY};
+            case CLIENT -> backend.toClient(screenX, screenY);
+            case FRAMEBUFFER -> {
+                int[] c = backend.toClient(screenX, screenY);
+                double s = backend.contentScale();
+                yield new int[] {(int) Math.round(c[0] * s), (int) Math.round(c[1] * s)};
+            }
+        };
     }
 
     private PointerState inSpace(PointerState screen) {
-        if (coordinateSpace == CoordinateSpace.CLIENT && backend.isWindowAttached()) {
-            int[] c = backend.toClient(screen.x(), screen.y());
-            return new PointerState(c[0], c[1], screen.buttons());
+        int[] p = project(screen.x(), screen.y());
+        if (p[0] == screen.x() && p[1] == screen.y()) {
+            return screen;
         }
-        return screen;
+        return new PointerState(p[0], p[1], screen.buttons());
     }
 
     private void emitMotion(int prevX, int prevY, int[] xy, PointerState now, PointerDelta rel, long ts) {

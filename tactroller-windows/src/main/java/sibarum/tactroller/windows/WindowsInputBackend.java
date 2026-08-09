@@ -96,6 +96,7 @@ public final class WindowsInputBackend implements InputBackend {
     private MethodHandle getForegroundWindow;
     private MethodHandle getClientRect;
     private MethodHandle getSystemMetrics;
+    private MethodHandle getDpiForWindow;
     private MethodHandle getModuleHandle;
     private MethodHandle registerClassEx;
     private MethodHandle createWindowEx;
@@ -141,6 +142,7 @@ public final class WindowsInputBackend implements InputBackend {
             getForegroundWindow = dc(linker, user32, "GetForegroundWindow", FunctionDescriptor.of(ADDRESS));
             getClientRect = dc(linker, user32, "GetClientRect", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS));
             getSystemMetrics = dc(linker, user32, "GetSystemMetrics", FunctionDescriptor.of(JAVA_INT, JAVA_INT));
+            getDpiForWindow = dc(linker, user32, "GetDpiForWindow", FunctionDescriptor.of(JAVA_INT, ADDRESS));
             registerClassEx = dc(linker, user32, "RegisterClassExW", FunctionDescriptor.of(JAVA_SHORT, ADDRESS));
             createWindowEx = dc(linker, user32, "CreateWindowExW", FunctionDescriptor.of(ADDRESS,
                     JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT,
@@ -335,12 +337,25 @@ public final class WindowsInputBackend implements InputBackend {
     public boolean isKeyDown(Key key) throws BackendException {
         Integer vk = vkByKey.get(key);
         if (vk == null) {
-            throw new BackendException("Key not mapped for Windows: " + key);
+            return false; // a key we cannot observe is reported as not-down (keeps pollKeys robust)
         }
         try {
             return down(vk);
         } catch (Throwable t) {
             throw new BackendException("Native key poll failed for " + key, t);
+        }
+    }
+
+    @Override
+    public boolean isButtonDown(MouseButton button) throws BackendException {
+        try {
+            return down(switch (button) {
+                case LEFT -> VK_LBUTTON;
+                case RIGHT -> VK_RBUTTON;
+                case MIDDLE -> VK_MBUTTON;
+            });
+        } catch (Throwable t) {
+            throw new BackendException("Native button poll failed for " + button, t);
         }
     }
 
@@ -484,6 +499,21 @@ public final class WindowsInputBackend implements InputBackend {
         }
     }
 
+    @Override
+    @SuppressWarnings("restricted")
+    public double contentScale() {
+        long hwnd = attachedHwnd;
+        if (hwnd == 0L) {
+            return 1.0;
+        }
+        try {
+            int dpi = (int) getDpiForWindow.invokeExact(MemorySegment.ofAddress(hwnd));
+            return dpi > 0 ? dpi / 96.0 : 1.0;
+        } catch (Throwable t) {
+            return 1.0;
+        }
+    }
+
     /** Center point (screen coords) used for RECENTER: attached window's client center, else screen center. */
     @SuppressWarnings("restricted")
     private int[] centerScreenPoint() throws Throwable {
@@ -588,6 +618,41 @@ public final class WindowsInputBackend implements InputBackend {
         m.put(Key.RIGHT_ALT, 0xA5);
         m.put(Key.LEFT_SUPER, 0x5B);
         m.put(Key.RIGHT_SUPER, 0x5C);
+
+        // Function keys VK_F1..VK_F12 = 0x70..0x7B.
+        for (int f = 1; f <= 12; f++) {
+            m.put(Key.valueOf("F" + f), 0x70 + (f - 1));
+        }
+        m.put(Key.INSERT, 0x2D);
+        m.put(Key.HOME, 0x24);
+        m.put(Key.END, 0x23);
+        m.put(Key.PAGE_UP, 0x21);
+        m.put(Key.PAGE_DOWN, 0x22);
+        m.put(Key.CAPS_LOCK, 0x14);
+
+        // Numpad VK_NUMPAD0..9 = 0x60..0x69.
+        for (int n = 0; n <= 9; n++) {
+            m.put(Key.valueOf("NUMPAD_" + n), 0x60 + n);
+        }
+        m.put(Key.NUMPAD_MULTIPLY, 0x6A);
+        m.put(Key.NUMPAD_ADD, 0x6B);
+        m.put(Key.NUMPAD_SUBTRACT, 0x6D);
+        m.put(Key.NUMPAD_DECIMAL, 0x6E);
+        m.put(Key.NUMPAD_DIVIDE, 0x6F);
+        m.put(Key.NUMPAD_ENTER, 0x0D); // VK_RETURN; not distinguishable from ENTER via GetAsyncKeyState
+
+        // OEM punctuation (US layout).
+        m.put(Key.MINUS, 0xBD);
+        m.put(Key.EQUAL, 0xBB);
+        m.put(Key.LEFT_BRACKET, 0xDB);
+        m.put(Key.RIGHT_BRACKET, 0xDD);
+        m.put(Key.BACKSLASH, 0xDC);
+        m.put(Key.SEMICOLON, 0xBA);
+        m.put(Key.APOSTROPHE, 0xDE);
+        m.put(Key.COMMA, 0xBC);
+        m.put(Key.PERIOD, 0xBE);
+        m.put(Key.SLASH, 0xBF);
+        m.put(Key.GRAVE_ACCENT, 0xC0);
         return m;
     }
 }

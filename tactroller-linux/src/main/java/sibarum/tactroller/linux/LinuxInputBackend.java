@@ -158,7 +158,7 @@ public final class LinuxInputBackend implements InputBackend {
     public boolean isKeyDown(Key key) throws BackendException {
         Integer keycode = keycodeByKey.get(key);
         if (keycode == null || keycode == 0) {
-            throw new BackendException("Key not mapped for X11: " + key);
+            return false; // unobservable key reported as not-down (keeps pollKeys robust)
         }
         try {
             int ok = (int) xQueryKeymap.invokeExact(display, keymap);

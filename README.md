@@ -45,9 +45,25 @@ Two interchangeable styles over the same backend:
 import sibarum.tactroller.api.*;
 
 try (Tactroller t = Tactroller.open()) {
-    PointerState p = t.pointer();
-    System.out.println(p.x() + "," + p.y() + " " + p.buttons());
     boolean jump = t.isKeyDown(Key.SPACE);
+    boolean fire = t.isButtonDown(MouseButton.LEFT);   // allocation-free
+}
+```
+
+**Per-frame snapshot** — the first-class render-thread path: one immutable `InputFrame` per frame
+with held state *and* edges, no background thread, no manual diffing:
+
+```java
+try (Tactroller t = Tactroller.open()) {
+    while (running) {                       // once per frame, on the render thread
+        InputFrame f = t.snapshot();
+        if (f.wasPressed(Key.SPACE)) jump();          // edge, not held state
+        if (f.isKeyDown(Key.W))      moveForward();
+        if (f.wasPressed(MouseButton.LEFT)) fire();
+        camera.turn(f.motion().dx(), f.motion().dy()); // relative delta since last frame
+        zoom(f.scroll().y());
+        if (f.hasModifier(Modifier.CONTROL)) ...
+    }
 }
 ```
 
@@ -93,7 +109,16 @@ try (Tactroller t = Tactroller.open()) {
 | Relative mouse / pointer-lock | `lockPointer(RAW\|RECENTER)`, `pollPointerDelta()` | RawInput deltas, or hide + `SetCursorPos` recenter |
 | Scroll wheel | `pollScroll()`, `InputEvent.Scrolled` | RawInput `WM_INPUT` wheel notches |
 | Window-relative coords | `attach()`, `setCoordinateSpace(CLIENT)` | `ScreenToClient` |
+| HiDPI / framebuffer coords | `contentScale()`, `setCoordinateSpace(FRAMEBUFFER)` | `GetDpiForWindow` |
 | Focus gating | `setFocusGated(true)`, `InputEvent.FocusChanged` | `GetForegroundWindow` |
+| Per-frame edges | `snapshot()` → `InputFrame` | shared (diffed in the API layer) |
+| Modifiers | `modifiers()`, `InputFrame.hasModifier` | derived from held keys |
+
+**Thread affinity:** the Windows backend runs its own RawInput message-only window on its own pump
+thread — it does *not* depend on the host window or its event pump, and the delta/scroll
+accumulators are drained via atomic swaps, so filling (pump thread) and draining (render thread) are
+safe across threads. For an engine with its own render loop, **poll `snapshot()` per frame and don't
+call `start()`**; `start()` is for retained-mode/event-driven consumers.
 
 Scroll and RAW pointer-lock are served by a **message-only window registered for RawInput** on a
 dedicated pump thread; its `WndProc` (an FFM upcall) only *accumulates* into atomic counters, which

@@ -9,9 +9,16 @@ public enum CoordinateSpace {
     SCREEN,
 
     /**
-     * Pixels relative to the attached window's client area (top-left origin). Requires a window to
-     * be attached via {@link Tactroller#attach(NativeWindow)}; using it with no window attached is
-     * an error.
+     * Pixels relative to the attached window's client area, in OS <em>logical</em> units
+     * (top-left origin). Requires a window attached via {@link Tactroller#attach(NativeWindow)}.
      */
-    CLIENT
+    CLIENT,
+
+    /**
+     * Pixels relative to the attached window's client area, scaled by {@link Tactroller#contentScale()}
+     * into <em>physical framebuffer</em> units. This is the space GPU/SDF hit-testing works in on
+     * HiDPI displays: on a 150% display a CLIENT coordinate of 100 maps to a FRAMEBUFFER coordinate
+     * of 150. Requires an attached window.
+     */
+    FRAMEBUFFER
 }

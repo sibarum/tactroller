@@ -52,6 +52,15 @@ public interface InputBackend extends AutoCloseable {
     boolean isKeyDown(Key key) throws BackendException;
 
     /**
+     * Test a single mouse button without allocating. The default reads {@link #pollPointer()} (which
+     * allocates a {@link PointerState}); backends should override with a direct native query to keep
+     * per-frame polling allocation-free.
+     */
+    default boolean isButtonDown(MouseButton button) throws BackendException {
+        return pollPointer().isPressed(button);
+    }
+
+    /**
      * Snapshot every key currently held down in a single query. The default polls each key via
      * {@link #isKeyDown(Key)}; backends whose native API can report the whole keyboard at once
      * (e.g. X11's {@code XQueryKeymap}) should override this for efficiency and to keep every key
@@ -108,12 +117,21 @@ public interface InputBackend extends AutoCloseable {
     }
 
     /**
-     * Convert a screen-space point to the attached window's client area.
+     * Convert a screen-space point to the attached window's client area (OS logical pixels).
      *
      * @return the converted point as {@code [clientX, clientY]}; identity if no window is attached
      */
     default int[] toClient(int screenX, int screenY) {
         return new int[] {screenX, screenY};
+    }
+
+    /**
+     * @return the attached window's content scale (DPI / 96 on Windows): 1.0 at 100%, 1.5 at 150%.
+     *         Used to convert {@code CLIENT} logical pixels to {@code FRAMEBUFFER} physical pixels.
+     *         Returns 1.0 when no window is attached or the backend cannot query DPI.
+     */
+    default double contentScale() {
+        return 1.0;
     }
 
     // ---- Pointer lock (relative motion / mouselook) ----------------------
