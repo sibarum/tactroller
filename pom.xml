@@ -21,6 +21,7 @@
     -->
     <modules>
         <module>tactroller-api</module>
+        <module>tactroller-clipboard</module>
     </modules>
 
     <properties>
@@ -55,6 +56,11 @@
             <dependency>
                 <groupId>sibarum.tactroller</groupId>
                 <artifactId>tactroller-linux</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>sibarum.tactroller</groupId>
+                <artifactId>tactroller-clipboard</artifactId>
                 <version>${project.version}</version>
             </dependency>
         </dependencies>

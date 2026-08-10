@@ -17,6 +17,7 @@ directly — no third-party runtime dependencies.
 | `tactroller-windows` | Panama bindings to `user32.dll` (`GetCursorPos`, `GetAsyncKeyState`).       |
 | `tactroller-macos`   | Panama bindings to CoreGraphics (`CGEventSourceKeyState`, `CGEventGetLocation`). |
 | `tactroller-linux`   | Panama bindings to `libX11` (`XQueryPointer`, `XQueryKeymap`).              |
+| `tactroller-clipboard` | Standalone system-clipboard text get/set. Independent of the input subsystem; Windows implemented. |
 
 ## OS auto-detection
 
@@ -149,6 +150,27 @@ Add the API plus the host platform module as dependencies (or let the reactor bu
   <version>1.0-SNAPSHOT</version>
 </dependency>
 ```
+
+## Clipboard
+
+`tactroller-clipboard` is a **standalone** module — it depends on nothing (not even `tactroller-api`),
+so a GUI can use it without the input subsystem. The host backend is picked at runtime from
+`os.name`; Windows is implemented (`user32`/`kernel32`, `CF_UNICODETEXT`), macOS/Linux are stubs that
+fail clearly until their bindings land.
+
+```java
+import sibarum.tactroller.clipboard.Clipboard;
+
+try (Clipboard cb = Clipboard.open()) {
+    cb.setText("copied");
+    Optional<String> pasted = cb.getText();   // reads the real OS clipboard
+    boolean has = cb.hasText();
+}
+```
+
+Unlike the input backends (compile-time OS selection via Maven profiles), clipboard uses one
+always-built module with a runtime OS factory — it binds only ever-present system libraries, so the
+per-OS profile split would be overkill for four functions.
 
 ## Requirements
 
