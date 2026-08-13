@@ -70,7 +70,12 @@ public final class Tactroller implements AutoCloseable {
             t -> System.getLogger(Tactroller.class.getName())
                     .log(System.Logger.Level.WARNING, "Tactroller event loop error", t);
 
+    // Non-null while a loop thread exists; cleared only once that thread is confirmed dead, so a
+    // timed-out stop() never lets start() spawn a second concurrent loop or close() free native
+    // resources underneath a still-running loop.
     private volatile Thread loopThread;
+    private volatile boolean stopRequested;
+    private volatile boolean closed;
     private volatile CoordinateSpace coordinateSpace = CoordinateSpace.SCREEN;
     private volatile boolean focusGated = true;
 
@@ -195,7 +200,7 @@ public final class Tactroller implements AutoCloseable {
         PointerState p = backend.pollPointer();
         Set<Key> keys = backend.pollKeys();
         Set<MouseButton> buttons = p.buttons();
-        int[] xy = project(p.x(), p.y());
+        int[] xy = project(p.x(), p.y(), coordinateSpace);
         long now = System.nanoTime();
 
         PointerDelta motion;
@@ -324,9 +329,16 @@ public final class Tactroller implements AutoCloseable {
         if (pollHz <= 0) {
             throw new IllegalArgumentException("pollHz must be positive: " + pollHz);
         }
+        if (closed) {
+            throw new IllegalStateException("Tactroller is closed");
+        }
+        // loopThread is cleared only once the previous loop is confirmed dead, so a non-null value
+        // here means a loop is still live — refuse to spawn a second one that would split the
+        // atomic accumulators between two draining threads.
         if (loopThread != null) {
             return;
         }
+        stopRequested = false;
         long periodNanos = 1_000_000_000L / pollHz;
         Thread t = new Thread(() -> runLoop(periodNanos), "tactroller-event-loop");
         t.setDaemon(true);
@@ -334,23 +346,55 @@ public final class Tactroller implements AutoCloseable {
         t.start();
     }
 
-    /** Stop the event loop and wait briefly for it to finish. No-op if not running. */
+    /**
+     * Stop the event loop and wait for it to finish. No-op if not running. If the loop does not
+     * terminate within the timeout (e.g. a listener is blocked), {@code loopThread} is left set and
+     * the condition is reported via the error handler, so callers cannot then start a second loop or
+     * tear down the backend underneath the live one.
+     */
     public synchronized void stop() {
         Thread t = loopThread;
         if (t == null) {
             return;
         }
-        loopThread = null;
+        stopRequested = true;
         t.interrupt();
+        if (joinUninterruptibly(t, 2_000L)) {
+            loopThread = null;
+        } else {
+            safelyReport(new BackendException(
+                    "Tactroller event loop did not terminate within 2s; a listener may be blocked. "
+                            + "Native teardown is deferred until the loop exits."));
+        }
+    }
+
+    /** Join {@code t} up to {@code millis}, deferring interrupts until after; @return true if it died. */
+    private static boolean joinUninterruptibly(Thread t, long millis) {
+        long deadlineNanos = System.nanoTime() + millis * 1_000_000L;
+        boolean interrupted = false;
         try {
-            t.join(1_000);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
+            while (t.isAlive()) {
+                long remainingNanos = deadlineNanos - System.nanoTime();
+                if (remainingNanos <= 0) {
+                    return false;
+                }
+                try {
+                    t.join(Math.max(1L, remainingNanos / 1_000_000L));
+                } catch (InterruptedException e) {
+                    interrupted = true;
+                }
+            }
+            return true;
+        } finally {
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
         }
     }
 
     public boolean isRunning() {
-        return loopThread != null;
+        Thread t = loopThread;
+        return t != null && t.isAlive();
     }
 
     private void runLoop(long periodNanos) {
@@ -361,7 +405,7 @@ public final class Tactroller implements AutoCloseable {
         boolean primed = false;
         boolean prevFocused = true;
 
-        while (loopThread == Thread.currentThread() && !Thread.currentThread().isInterrupted()) {
+        while (!stopRequested && !Thread.currentThread().isInterrupted()) {
             long tickStart = System.nanoTime();
             try {
                 boolean focused = backend.isFocused();
@@ -374,13 +418,17 @@ public final class Tactroller implements AutoCloseable {
                 Set<Key> keys = backend.pollKeys();
                 long now = System.nanoTime();
 
+                // Snapshot the coordinate space once and project once, so both the emitted position
+                // and the baseline stored for the next tick live in the same space even if
+                // setCoordinateSpace() runs concurrently mid-tick.
+                int[] xy = project(pointer.x(), pointer.y(), coordinateSpace);
+
                 if (focused != prevFocused && backend.isWindowAttached()) {
                     dispatch(new InputEvent.FocusChanged(focused, now));
                     prevFocused = focused;
                 }
 
                 if (!gated && primed) {
-                    int[] xy = project(pointer.x(), pointer.y());
                     emitMotion(prevX, prevY, xy, pointer, relMotion, now);
                     emitScroll(scroll, xy, now);
                     emitButtons(prevButtons, pointer, xy, now);
@@ -389,8 +437,8 @@ public final class Tactroller implements AutoCloseable {
 
                 prevKeys = keys;
                 prevButtons = pointer.buttons();
-                prevX = project(pointer.x(), pointer.y())[0];
-                prevY = project(pointer.x(), pointer.y())[1];
+                prevX = xy[0];
+                prevY = xy[1];
                 primed = true;
             } catch (BackendException e) {
                 safelyReport(e);
@@ -408,12 +456,12 @@ public final class Tactroller implements AutoCloseable {
         }
     }
 
-    /** Project a screen point into the configured coordinate space (falls back to screen if detached). */
-    private int[] project(int screenX, int screenY) {
+    /** Project a screen point into the given coordinate space (falls back to screen if detached). */
+    private int[] project(int screenX, int screenY, CoordinateSpace space) {
         if (!backend.isWindowAttached()) {
             return new int[] {screenX, screenY};
         }
-        return switch (coordinateSpace) {
+        return switch (space) {
             case SCREEN -> new int[] {screenX, screenY};
             case CLIENT -> backend.toClient(screenX, screenY);
             case FRAMEBUFFER -> {
@@ -425,7 +473,7 @@ public final class Tactroller implements AutoCloseable {
     }
 
     private PointerState inSpace(PointerState screen) {
-        int[] p = project(screen.x(), screen.y());
+        int[] p = project(screen.x(), screen.y(), coordinateSpace);
         if (p[0] == screen.x() && p[1] == screen.y()) {
             return screen;
         }
@@ -492,8 +540,17 @@ public final class Tactroller implements AutoCloseable {
     }
 
     @Override
-    public void close() {
+    public synchronized void close() {
+        if (closed) {
+            return;
+        }
         stop();
+        if (loopThread != null) {
+            // The loop did not terminate (stop() already reported why). Do not free the backend's
+            // native resources while the loop thread may still be calling into them.
+            return;
+        }
+        closed = true;
         backend.clearPointerLock();
         backend.detach();
         backend.close();

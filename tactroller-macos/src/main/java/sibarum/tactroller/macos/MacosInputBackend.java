@@ -50,6 +50,13 @@ public final class MacosInputBackend implements InputBackend {
     private static final int COMBINED_SESSION_STATE = 0;
 
     private Arena arena;
+    /**
+     * Reusable 16-byte scratch buffer for CGEventGetLocation's by-value CGPoint return.
+     * Allocated once from {@link #arena}; the returned struct is copied out immediately in
+     * {@link #pollPointer()}, so reusing a single buffer avoids leaking 16 bytes per poll.
+     * Safe because pollPointer is confined to a single polling thread.
+     */
+    private MemorySegment locBuffer;
     private MethodHandle cgEventCreate;
     private MethodHandle cgEventGetLocation;
     private MethodHandle cgEventSourceKeyState;
@@ -68,6 +75,7 @@ public final class MacosInputBackend implements InputBackend {
     public void initialize() throws BackendException {
         try {
             arena = Arena.ofShared();
+            locBuffer = arena.allocate(CGPOINT);
             Linker linker = Linker.nativeLinker();
             SymbolLookup cg = SymbolLookup.libraryLookup(CORE_GRAPHICS, arena);
             SymbolLookup cf = SymbolLookup.libraryLookup(CORE_FOUNDATION, arena);
@@ -101,7 +109,11 @@ public final class MacosInputBackend implements InputBackend {
                 throw new BackendException("CGEventCreate returned NULL");
             }
             try {
-                MemorySegment loc = (MemorySegment) cgEventGetLocation.invokeExact((java.lang.foreign.SegmentAllocator) arena, event);
+                // Reuse a single scratch buffer for the by-value CGPoint return instead of the
+                // growing shared arena, which would leak 16 bytes on every poll. The struct is
+                // copied out into x/y immediately below, so it need not outlive this call.
+                MemorySegment loc = (MemorySegment) cgEventGetLocation.invokeExact(
+                        (java.lang.foreign.SegmentAllocator) (size, align) -> locBuffer, event);
                 int x = (int) loc.get(ValueLayout.JAVA_DOUBLE, 0);
                 int y = (int) loc.get(ValueLayout.JAVA_DOUBLE, 8);
 
@@ -143,6 +155,7 @@ public final class MacosInputBackend implements InputBackend {
         if (arena != null) {
             arena.close();
             arena = null;
+            locBuffer = null;
         }
     }
 
