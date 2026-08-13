@@ -8,6 +8,7 @@ import sibarum.tactroller.api.InputEvent;
 import sibarum.tactroller.api.InputFrame;
 import sibarum.tactroller.api.Key;
 import sibarum.tactroller.api.MouseButton;
+import sibarum.tactroller.api.PointerDelta;
 import sibarum.tactroller.api.PointerState;
 import sibarum.tactroller.api.ScrollDelta;
 
@@ -18,8 +19,9 @@ import java.util.Set;
  * Turns Tactroller {@link InputFrame}s into Atchung traffic, applying the two-shapes split:
  *
  * <ul>
- *   <li><b>Discrete edges</b> (key/button press &amp; release, scroll, focus change) → {@link #events()}
- *       {@link Topic} events, lossless.</li>
+ *   <li><b>Discrete edges</b> (key/button press &amp; release, relative pointer motion, scroll, focus change)
+ *       → {@link #events()} {@link Topic} events, lossless. Motion is here, not on the State, because each
+ *       frame's delta must be summed — coalescing to "latest" would drop intervening motion.</li>
  *   <li><b>Pointer position</b> (latest-only) → {@link #pointer()} {@link State}, coalesced &amp; versioned.</li>
  * </ul>
  *
@@ -78,6 +80,17 @@ public final class InputPublisher {
         ScrollDelta scroll = f.scroll();
         if (!scroll.isZero()) {
             bus.publish(events, new InputEvent.Scrolled(scroll.x(), scroll.y(), f.pointerX(), f.pointerY(), ts));
+        }
+
+        // Relative motion is a lossless "must-sum" signal (each frame's delta matters and consumers add them
+        // up), so it rides the edge Topic, not the coalesced pointer State. This is also the sole place the
+        // snapshot's captured delta is surfaced — publishing it here keeps snapshot() the only drain of the
+        // backend's relative-motion accumulator, so consumers must read motion from the bus, never poll
+        // pollPointerDelta() in parallel (that second drain steals the delta; see the render-loop contract).
+        PointerDelta motion = f.motion();
+        if (!motion.isZero()) {
+            bus.publish(events, new InputEvent.PointerMoved(
+                    f.pointerX(), f.pointerY(), motion.dx(), motion.dy(), ts));
         }
 
         if (f.focused() != prevFocused) {
