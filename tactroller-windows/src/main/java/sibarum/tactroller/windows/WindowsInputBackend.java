@@ -27,6 +27,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static java.lang.foreign.ValueLayout.ADDRESS;
+import static java.lang.foreign.ValueLayout.JAVA_BYTE;
 import static java.lang.foreign.ValueLayout.JAVA_INT;
 import static java.lang.foreign.ValueLayout.JAVA_LONG;
 import static java.lang.foreign.ValueLayout.JAVA_SHORT;
@@ -57,6 +58,15 @@ public final class WindowsInputBackend implements InputBackend {
     private static final int RID_INPUT = 0x10000003;
     private static final int RIDEV_INPUTSINK = 0x00000100;
     private static final int RAWINPUTHEADER_SIZE = 24;
+    private static final int RIM_TYPEMOUSE = 0;
+    private static final int RIM_TYPEKEYBOARD = 1;
+    private static final int RI_KEY_BREAK = 0x01; // key-up flag in RAWKEYBOARD.Flags
+    private static final int MAPVK_VK_TO_VSC = 0;
+    private static final int VK_SHIFT = 0x10;
+    private static final int VK_CONTROL = 0x11;
+    private static final int VK_MENU = 0x12; // ALT
+    private static final int VK_CAPITAL = 0x14;
+    private static final int TOGGLED_MASK = 0x01;
     private static final int RI_MOUSE_WHEEL = 0x0400;
     private static final int RI_MOUSE_HWHEEL = 0x0800;
     private static final int MOUSE_MOVE_ABSOLUTE = 0x01;
@@ -79,11 +89,16 @@ public final class WindowsInputBackend implements InputBackend {
     private final AtomicInteger rawDy = new AtomicInteger();
     private final AtomicInteger scrollUnitsX = new AtomicInteger();
     private final AtomicInteger scrollUnitsY = new AtomicInteger();
+    // Typed characters (UTF-16 units) accumulated on the pump thread, drained by the loop/poll thread.
+    private final StringBuilder charBuf = new StringBuilder();
+    private final Object charLock = new Object();
 
     private Arena arena;
     private MemorySegment pointBuffer;      // reusable POINT for pollPointer (loop/poll thread)
     private MemorySegment rawInputBuffer;   // reusable RAWINPUT buffer (pump thread only)
     private MemorySegment rawInputSize;     // reusable pcbSize (pump thread only)
+    private MemorySegment keyStateBuffer;   // 256-byte keyboard state for ToUnicodeEx (pump thread only)
+    private MemorySegment uniBuffer;         // UTF-16 output for ToUnicodeEx (pump thread only)
 
     // user32 / kernel32 handles.
     private MethodHandle getCursorPos;
@@ -109,6 +124,10 @@ public final class WindowsInputBackend implements InputBackend {
     private MethodHandle dispatchMessage;
     private MethodHandle postThreadMessage;
     private MethodHandle getCurrentThreadId;
+    private MethodHandle mapVirtualKey;
+    private MethodHandle getKeyboardLayout;
+    private MethodHandle getKeyState;
+    private MethodHandle toUnicodeEx;
 
     private Thread pumpThread;
     private volatile int pumpThreadId;
@@ -162,10 +181,17 @@ public final class WindowsInputBackend implements InputBackend {
                     FunctionDescriptor.of(JAVA_INT, JAVA_INT, JAVA_INT, JAVA_LONG, JAVA_LONG));
             getModuleHandle = dc(linker, kernel32, "GetModuleHandleW", FunctionDescriptor.of(ADDRESS, ADDRESS));
             getCurrentThreadId = dc(linker, kernel32, "GetCurrentThreadId", FunctionDescriptor.of(JAVA_INT));
+            mapVirtualKey = dc(linker, user32, "MapVirtualKeyW", FunctionDescriptor.of(JAVA_INT, JAVA_INT, JAVA_INT));
+            getKeyboardLayout = dc(linker, user32, "GetKeyboardLayout", FunctionDescriptor.of(ADDRESS, JAVA_INT));
+            getKeyState = dc(linker, user32, "GetKeyState", FunctionDescriptor.of(JAVA_SHORT, JAVA_INT));
+            toUnicodeEx = dc(linker, user32, "ToUnicodeEx", FunctionDescriptor.of(JAVA_INT,
+                    JAVA_INT, JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, JAVA_INT, ADDRESS));
 
             pointBuffer = arena.allocate(POINT);
             rawInputBuffer = arena.allocate(64);
             rawInputSize = arena.allocate(JAVA_INT);
+            keyStateBuffer = arena.allocate(256);
+            uniBuffer = arena.allocate(16); // up to 8 UTF-16 units (2 bytes each) per keystroke
 
             MemorySegment wndProcStub = makeWndProcStub(linker);
             startPumpThread(linker, wndProcStub);
@@ -234,13 +260,19 @@ public final class WindowsInputBackend implements InputBackend {
             }
             messageHwnd = hwnd;
 
-            // RAWINPUTDEVICE (16 bytes): usUsagePage@0, usUsage@2, dwFlags@4, hwndTarget@8.
-            MemorySegment rid = pump.allocate(16);
-            rid.set(JAVA_SHORT, 0, (short) 0x01); // generic desktop
-            rid.set(JAVA_SHORT, 2, (short) 0x02); // mouse
+            // Two RAWINPUTDEVICEs (16 bytes each): mouse (for wheel/relative motion) and keyboard (for typed
+            // text). usUsagePage@0, usUsage@2, dwFlags@4, hwndTarget@8. INPUTSINK so we receive input even when
+            // this message-only window is not focused (focus gating happens later, at emit time).
+            MemorySegment rid = pump.allocate(32);
+            rid.set(JAVA_SHORT, 0, (short) 0x01);  // generic desktop
+            rid.set(JAVA_SHORT, 2, (short) 0x02);  // mouse
             rid.set(JAVA_INT, 4, RIDEV_INPUTSINK);
             rid.set(ADDRESS, 8, hwnd);
-            int ok = (int) registerRawInputDevices.invokeExact(rid, 1, 16);
+            rid.set(JAVA_SHORT, 16, (short) 0x01); // generic desktop
+            rid.set(JAVA_SHORT, 18, (short) 0x06); // keyboard
+            rid.set(JAVA_INT, 20, RIDEV_INPUTSINK);
+            rid.set(ADDRESS, 24, hwnd);
+            int ok = (int) registerRawInputDevices.invokeExact(rid, 2, 16);
             if (ok == 0) {
                 throw new IllegalStateException("RegisterRawInputDevices failed");
             }
@@ -285,7 +317,8 @@ public final class WindowsInputBackend implements InputBackend {
                 rawInputSize.set(JAVA_INT, 0, 64);
                 int n = (int) getRawInputData.invokeExact(
                         hRawInput, RID_INPUT, rawInputBuffer, rawInputSize, RAWINPUTHEADER_SIZE);
-                if (n > 0 && rawInputBuffer.get(JAVA_INT, 0) == 0) { // dwType == RIM_TYPEMOUSE
+                int dwType = n > 0 ? rawInputBuffer.get(JAVA_INT, 0) : -1;
+                if (dwType == RIM_TYPEMOUSE) {
                     int usFlags = rawInputBuffer.get(JAVA_SHORT, 24) & 0xFFFF;
                     int usButtonFlags = rawInputBuffer.get(JAVA_SHORT, 28) & 0xFFFF;
                     short usButtonData = rawInputBuffer.get(JAVA_SHORT, 30);
@@ -301,12 +334,65 @@ public final class WindowsInputBackend implements InputBackend {
                     if ((usButtonFlags & RI_MOUSE_HWHEEL) != 0) {
                         scrollUnitsX.addAndGet(usButtonData);
                     }
+                } else if (dwType == RIM_TYPEKEYBOARD) {
+                    // RAWKEYBOARD begins at offset 24: MakeCode@24, Flags@26, Reserved@28, VKey@30, Message@32.
+                    int flags = rawInputBuffer.get(JAVA_SHORT, 26) & 0xFFFF;
+                    int vKey = rawInputBuffer.get(JAVA_SHORT, 30) & 0xFFFF;
+                    if ((flags & RI_KEY_BREAK) == 0) { // key-down only
+                        translateToChars(vKey);
+                    }
                 }
             }
             return (long) defWindowProc.invokeExact(hwnd, msg, wParam, lParam);
         } catch (Throwable t) {
             // Never let an exception cross the native boundary.
             return 0L;
+        }
+    }
+
+    /**
+     * Translate a key-down virtual key to text via {@code ToUnicodeEx} and accumulate the produced UTF-16
+     * units (runs on the pump thread). The keyboard state is rebuilt from {@code GetAsyncKeyState}/
+     * {@code GetKeyState} because this message-only window is not the focused queue, so the per-thread state
+     * {@code ToUnicodeEx} would otherwise read is not maintained here. Shortcut chords (Control without Alt)
+     * produce no text — that keeps the command channel ({@code KeyPressed}) and the text channel disjoint —
+     * and control characters (Enter/Tab/Backspace/Escape) are filtered out, as those are handled as keys.
+     */
+    @SuppressWarnings("restricted")
+    private void translateToChars(int vKey) throws Throwable {
+        // Skip pure modifiers/fake keys — they never produce text and would waste a ToUnicodeEx call.
+        if (vKey == 0 || vKey == 0xFF || (vKey >= 0xA0 && vKey <= 0xA5) || vKey == VK_SHIFT
+                || vKey == VK_CONTROL || vKey == VK_MENU || vKey == VK_CAPITAL) {
+            return;
+        }
+        boolean shift = down(VK_SHIFT);
+        boolean ctrl = down(VK_CONTROL);
+        boolean alt = down(VK_MENU);
+        // Ctrl (without Alt) means a shortcut chord, not typed text. AltGr (== Ctrl+Alt) still types.
+        if (ctrl && !alt) {
+            return;
+        }
+        keyStateBuffer.fill((byte) 0);
+        if (shift) keyStateBuffer.set(JAVA_BYTE, VK_SHIFT, (byte) 0x80);
+        if (ctrl) keyStateBuffer.set(JAVA_BYTE, VK_CONTROL, (byte) 0x80);
+        if (alt) keyStateBuffer.set(JAVA_BYTE, VK_MENU, (byte) 0x80);
+        if ((((short) getKeyState.invokeExact(VK_CAPITAL)) & TOGGLED_MASK) != 0) {
+            keyStateBuffer.set(JAVA_BYTE, VK_CAPITAL, (byte) TOGGLED_MASK);
+        }
+
+        int scan = (int) mapVirtualKey.invokeExact(vKey, MAPVK_VK_TO_VSC);
+        MemorySegment hkl = (MemorySegment) getKeyboardLayout.invokeExact(0);
+        int rc = (int) toUnicodeEx.invokeExact(vKey, scan, keyStateBuffer, uniBuffer, 8, 0, hkl);
+        if (rc <= 0) {
+            return; // 0 = no translation; -1 = dead key (buffered by the OS for the next keystroke)
+        }
+        synchronized (charLock) {
+            for (int i = 0; i < rc; i++) {
+                char c = (char) (uniBuffer.get(JAVA_SHORT, i * 2L) & 0xFFFF);
+                if (c >= 0x20 && c != 0x7F) { // drop control chars — those ride the KeyPressed channel
+                    charBuf.append(c);
+                }
+            }
         }
     }
 
@@ -374,6 +460,19 @@ public final class WindowsInputBackend implements InputBackend {
             return ScrollDelta.ZERO;
         }
         return new ScrollDelta((double) x / WHEEL_DELTA, (double) y / WHEEL_DELTA);
+    }
+
+    @Override
+    public int[] drainChars() {
+        String s;
+        synchronized (charLock) {
+            if (charBuf.length() == 0) {
+                return NO_CHARS;
+            }
+            s = charBuf.toString();
+            charBuf.setLength(0);
+        }
+        return s.codePoints().toArray(); // fold any UTF-16 surrogate pairs into single code points
     }
 
     @Override

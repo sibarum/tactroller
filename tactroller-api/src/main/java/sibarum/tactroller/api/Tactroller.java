@@ -197,6 +197,7 @@ public final class Tactroller implements AutoCloseable {
     public synchronized InputFrame snapshot() throws BackendException {
         boolean focused = backend.isFocused();
         ScrollDelta scroll = backend.drainScroll();
+        int[] chars = backend.drainChars();
         PointerState p = backend.pollPointer();
         Set<Key> keys = backend.pollKeys();
         Set<MouseButton> buttons = p.buttons();
@@ -221,7 +222,7 @@ public final class Tactroller implements AutoCloseable {
                 keys, pressedKeys, releasedKeys,
                 buttons, pressedBtn, releasedBtn,
                 Modifier.from(keys),
-                xy[0], xy[1], motion, scroll, focused, now);
+                xy[0], xy[1], motion, scroll, focused, now, chars);
 
         snapPrevKeys = keys;
         snapPrevButtons = buttons;
@@ -414,6 +415,7 @@ public final class Tactroller implements AutoCloseable {
                 // Always drain accumulators so they never build up while gated/idle.
                 PointerDelta relMotion = backend.drainPointerDelta();
                 ScrollDelta scroll = backend.drainScroll();
+                int[] chars = backend.drainChars();
                 PointerState pointer = backend.pollPointer();
                 Set<Key> keys = backend.pollKeys();
                 long now = System.nanoTime();
@@ -433,6 +435,7 @@ public final class Tactroller implements AutoCloseable {
                     emitScroll(scroll, xy, now);
                     emitButtons(prevButtons, pointer, xy, now);
                     emitKeys(prevKeys, keys, now);
+                    emitChars(chars, now);
                 }
 
                 prevKeys = keys;
@@ -518,6 +521,12 @@ public final class Tactroller implements AutoCloseable {
             if (!now.contains(k)) {
                 dispatch(new InputEvent.KeyReleased(k, ts));
             }
+        }
+    }
+
+    private void emitChars(int[] chars, long ts) {
+        for (int cp : chars) {
+            dispatch(new InputEvent.CharTyped(cp, ts));
         }
     }
 

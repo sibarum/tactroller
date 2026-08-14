@@ -17,6 +17,7 @@ package sibarum.tactroller.api;
  *     case InputEvent.ButtonPressed b  -> ...
  *     case InputEvent.ButtonReleased b -> ...
  *     case InputEvent.Scrolled s       -> ...
+ *     case InputEvent.CharTyped c      -> ...
  *     case InputEvent.FocusChanged f   -> ...
  * }
  * }</pre>
@@ -60,6 +61,18 @@ public sealed interface InputEvent {
      * @param y       pointer position when the scroll occurred
      */
     record Scrolled(double xOffset, double yOffset, int x, int y, long timestampNanos) implements InputEvent {}
+
+    /**
+     * A character was produced by the keyboard — the <em>text</em> channel, distinct from
+     * {@link KeyPressed} (the command channel). Carries a Unicode {@code codepoint} already resolved
+     * through the OS keyboard layout, dead keys and (later) IME composition, so consumers insert text
+     * without re-deriving characters from key codes. Modifier-only shortcut chords (e.g. Ctrl+C) do
+     * <em>not</em> produce a {@code CharTyped}; control characters and text edits keep their separate
+     * lanes (the classic "Ctrl+C also inserts a character" bug is thereby impossible).
+     *
+     * @param codepoint the produced Unicode code point
+     */
+    record CharTyped(int codepoint, long timestampNanos) implements InputEvent {}
 
     /**
      * The attached window gained or lost input focus. Only emitted when a window is attached via

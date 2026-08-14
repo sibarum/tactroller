@@ -15,6 +15,11 @@ import java.util.Set;
  * configured on the {@code Tactroller} at snapshot time. {@link #motion()} is the relative pointer
  * delta since the previous snapshot (the captured device/recenter delta while pointer-locked).
  * {@link #scroll()} is the wheel movement since the previous snapshot.
+ *
+ * <p>{@link #typedChars()} are the Unicode code points produced by the keyboard this frame (layout-
+ * and dead-key-resolved text; see {@link InputEvent.CharTyped}), distinct from the {@code KeyPressed}
+ * command channel. The array is defensively cloned on construction and read-back; note it is compared
+ * by identity in the record's generated {@code equals} (frames are not value-compared in practice).
  */
 public record InputFrame(
         Set<Key> heldKeys,
@@ -29,7 +34,8 @@ public record InputFrame(
         PointerDelta motion,
         ScrollDelta scroll,
         boolean focused,
-        long timestampNanos) {
+        long timestampNanos,
+        int[] typedChars) {
 
     public InputFrame {
         heldKeys = Set.copyOf(heldKeys);
@@ -39,6 +45,34 @@ public record InputFrame(
         pressedButtons = Set.copyOf(pressedButtons);
         releasedButtons = Set.copyOf(releasedButtons);
         modifiers = Set.copyOf(modifiers);
+        typedChars = typedChars == null || typedChars.length == 0 ? InputBackend.NO_CHARS : typedChars.clone();
+    }
+
+    /**
+     * Backward-compatible constructor for a frame with no typed characters (keeps existing call sites
+     * that predate the text channel working unchanged).
+     */
+    public InputFrame(
+            Set<Key> heldKeys,
+            Set<Key> pressedKeys,
+            Set<Key> releasedKeys,
+            Set<MouseButton> heldButtons,
+            Set<MouseButton> pressedButtons,
+            Set<MouseButton> releasedButtons,
+            Set<Modifier> modifiers,
+            int pointerX,
+            int pointerY,
+            PointerDelta motion,
+            ScrollDelta scroll,
+            boolean focused,
+            long timestampNanos) {
+        this(heldKeys, pressedKeys, releasedKeys, heldButtons, pressedButtons, releasedButtons, modifiers,
+                pointerX, pointerY, motion, scroll, focused, timestampNanos, InputBackend.NO_CHARS);
+    }
+
+    /** @return a copy of the code points typed this frame (empty if none), in order. */
+    public int[] typedChars() {
+        return typedChars.length == 0 ? typedChars : typedChars.clone();
     }
 
     /** @return whether {@code key} is held this frame. */

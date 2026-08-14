@@ -82,6 +82,12 @@ public final class InputPublisher {
             bus.publish(events, new InputEvent.Scrolled(scroll.x(), scroll.y(), f.pointerX(), f.pointerY(), ts));
         }
 
+        // Typed text (layout-resolved code points) — the lossless text channel, one event per code point,
+        // kept strictly separate from the KeyPressed command channel above.
+        for (int cp : f.typedChars()) {
+            bus.publish(events, new InputEvent.CharTyped(cp, ts));
+        }
+
         // Relative motion is a lossless "must-sum" signal (each frame's delta matters and consumers add them
         // up), so it rides the edge Topic, not the coalesced pointer State. This is also the sole place the
         // snapshot's captured delta is surfaced — publishing it here keeps snapshot() the only drain of the

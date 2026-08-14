@@ -180,6 +180,24 @@ public interface InputBackend extends AutoCloseable {
         return ScrollDelta.ZERO;
     }
 
+    // ---- Typed characters -------------------------------------------------
+
+    /** Shared empty result so the common "nothing typed" path allocates nothing. */
+    int[] NO_CHARS = new int[0];
+
+    /**
+     * Drain the Unicode code points typed since the last call, resetting the accumulator. These are
+     * layout-/dead-key-resolved characters (from the platform's text path, e.g. Win32 {@code WM_CHAR}
+     * or {@code ToUnicodeEx}), <b>not</b> key codes — see {@link InputEvent.CharTyped}. Order-preserving.
+     *
+     * <p>Like {@link #drainScroll()} this is an accumulator filled on the backend's native pump thread
+     * and drained (via an atomic/locked swap) by the loop/poll thread, so it is safe to drain from a
+     * different thread than the one filling it. A backend without a text path returns {@link #NO_CHARS}.
+     */
+    default int[] drainChars() {
+        return NO_CHARS;
+    }
+
     /** Release native resources. Idempotent. */
     @Override
     void close();
