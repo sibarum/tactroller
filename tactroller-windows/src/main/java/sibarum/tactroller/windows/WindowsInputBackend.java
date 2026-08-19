@@ -35,41 +35,32 @@ import static java.lang.foreign.ValueLayout.JAVA_SHORT;
 /**
  * Windows {@link InputBackend} on the Panama FFM API.
  *
- * <p>Absolute pointer position, key and button state come from polling {@code user32.dll}
- * ({@code GetCursorPos}, {@code GetAsyncKeyState}). Scroll wheel and raw relative motion cannot be
- * polled on Windows, so this backend runs its own <b>message-only window</b> registered for
- * <b>RawInput</b> ({@code WM_INPUT}) on a dedicated pump thread; the window procedure (an FFM
- * upcall) only <i>accumulates</i> wheel notches and raw deltas into atomic counters. The shared
- * event loop drains those via {@link #drainScroll()} / {@link #drainPointerDelta()}, so event
- * emission still happens in one place.
+ * <p><b>This class is the per-window half.</b> Absolute pointer position, key and button state come from
+ * polling {@code user32.dll} ({@code GetCursorPos}, {@code GetAsyncKeyState}), and window attachment supplies
+ * client-relative coordinates ({@code ScreenToClient}) plus the two routing gates: {@link #isFocused()} for
+ * focal channels (keys, typed text) and {@link #isPointerInClient()} for positional ones (wheel, pointer).
+ *
+ * <p>Scroll wheel, raw relative motion and typed text cannot be polled on Windows — they arrive via RawInput,
+ * which is <b>process-scoped</b>: one registration per usage pair wins for the entire process. That half lives
+ * in {@link WindowsRawInputHub}, which runs a single pump for the process and fans every report into every
+ * live backend through {@link #acceptRawMouse} / {@link #acceptChars}; the loop thread then drains this
+ * instance's accumulators via {@link #drainScroll()} / {@link #drainPointerDelta()} / {@link #drainChars()}.
+ *
+ * <p><b>Keep that split.</b> Anything process- or globally-scoped belongs in the hub, never here — a
+ * per-instance registration silently steals input from every other window. {@code RawInputScopeGuardTest}
+ * enforces this by scanning bytecode.
  *
  * <p>Pointer lock supports both {@link PointerLockMode#RECENTER} (warp-to-center each drain) and
- * {@link PointerLockMode#RAW} (RawInput deltas). Window attachment enables focus gating
- * ({@code GetForegroundWindow}) and client-relative coordinates ({@code ScreenToClient}).
+ * {@link PointerLockMode#RAW} (RawInput deltas). Note that it manipulates <b>globally</b>-scoped state
+ * ({@code ClipCursor}, {@code ShowCursor}, {@code SetCursorPos}), so at most one window in a process should
+ * hold the lock at a time; the application arbitrates that today.
  */
 public final class WindowsInputBackend implements InputBackend {
 
-    private static final AtomicInteger CLASS_SEQ = new AtomicInteger();
-
-    // Win32 constants.
-    private static final int WM_INPUT = 0x00FF;
-    private static final int WM_QUIT = 0x0012;
-    private static final long HWND_MESSAGE = -3L;
-    private static final int RID_INPUT = 0x10000003;
-    private static final int RIDEV_INPUTSINK = 0x00000100;
-    private static final int RAWINPUTHEADER_SIZE = 24;
-    private static final int RIM_TYPEMOUSE = 0;
-    private static final int RIM_TYPEKEYBOARD = 1;
-    private static final int RI_KEY_BREAK = 0x01; // key-up flag in RAWKEYBOARD.Flags
-    private static final int MAPVK_VK_TO_VSC = 0;
+    // Win32 constants. (The RawInput/message-pump constants live in WindowsRawInputHub with their code.)
     private static final int VK_SHIFT = 0x10;
     private static final int VK_CONTROL = 0x11;
     private static final int VK_MENU = 0x12; // ALT
-    private static final int VK_CAPITAL = 0x14;
-    private static final int TOGGLED_MASK = 0x01;
-    private static final int RI_MOUSE_WHEEL = 0x0400;
-    private static final int RI_MOUSE_HWHEEL = 0x0800;
-    private static final int MOUSE_MOVE_ABSOLUTE = 0x01;
     private static final int WHEEL_DELTA = 120;
     private static final int SM_CXSCREEN = 0;
     private static final int SM_CYSCREEN = 1;
@@ -95,10 +86,6 @@ public final class WindowsInputBackend implements InputBackend {
 
     private Arena arena;
     private MemorySegment pointBuffer;      // reusable POINT for pollPointer (loop/poll thread)
-    private MemorySegment rawInputBuffer;   // reusable RAWINPUT buffer (pump thread only)
-    private MemorySegment rawInputSize;     // reusable pcbSize (pump thread only)
-    private MemorySegment keyStateBuffer;   // 256-byte keyboard state for ToUnicodeEx (pump thread only)
-    private MemorySegment uniBuffer;         // UTF-16 output for ToUnicodeEx (pump thread only)
 
     // user32 / kernel32 handles.
     private MethodHandle getCursorPos;
@@ -112,27 +99,6 @@ public final class WindowsInputBackend implements InputBackend {
     private MethodHandle getClientRect;
     private MethodHandle getSystemMetrics;
     private MethodHandle getDpiForWindow;
-    private MethodHandle getModuleHandle;
-    private MethodHandle registerClassEx;
-    private MethodHandle createWindowEx;
-    private MethodHandle defWindowProc;
-    private MethodHandle destroyWindow;
-    private MethodHandle registerRawInputDevices;
-    private MethodHandle getRawInputData;
-    private MethodHandle getMessage;
-    private MethodHandle translateMessage;
-    private MethodHandle dispatchMessage;
-    private MethodHandle postThreadMessage;
-    private MethodHandle getCurrentThreadId;
-    private MethodHandle mapVirtualKey;
-    private MethodHandle getKeyboardLayout;
-    private MethodHandle getKeyState;
-    private MethodHandle toUnicodeEx;
-
-    private Thread pumpThread;
-    private volatile int pumpThreadId;
-    private volatile MemorySegment messageHwnd = MemorySegment.NULL;
-    private volatile Throwable pumpInitError;
 
     private volatile long attachedHwnd;
     private volatile PointerLockMode lockMode;
@@ -162,39 +128,12 @@ public final class WindowsInputBackend implements InputBackend {
             getClientRect = dc(linker, user32, "GetClientRect", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS));
             getSystemMetrics = dc(linker, user32, "GetSystemMetrics", FunctionDescriptor.of(JAVA_INT, JAVA_INT));
             getDpiForWindow = dc(linker, user32, "GetDpiForWindow", FunctionDescriptor.of(JAVA_INT, ADDRESS));
-            registerClassEx = dc(linker, user32, "RegisterClassExW", FunctionDescriptor.of(JAVA_SHORT, ADDRESS));
-            createWindowEx = dc(linker, user32, "CreateWindowExW", FunctionDescriptor.of(ADDRESS,
-                    JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT,
-                    ADDRESS, ADDRESS, ADDRESS, ADDRESS));
-            defWindowProc = dc(linker, user32, "DefWindowProcW",
-                    FunctionDescriptor.of(JAVA_LONG, ADDRESS, JAVA_INT, JAVA_LONG, JAVA_LONG));
-            destroyWindow = dc(linker, user32, "DestroyWindow", FunctionDescriptor.of(JAVA_INT, ADDRESS));
-            registerRawInputDevices = dc(linker, user32, "RegisterRawInputDevices",
-                    FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT, JAVA_INT));
-            getRawInputData = dc(linker, user32, "GetRawInputData",
-                    FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT, ADDRESS, ADDRESS, JAVA_INT));
-            getMessage = dc(linker, user32, "GetMessageW",
-                    FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, JAVA_INT));
-            translateMessage = dc(linker, user32, "TranslateMessage", FunctionDescriptor.of(JAVA_INT, ADDRESS));
-            dispatchMessage = dc(linker, user32, "DispatchMessageW", FunctionDescriptor.of(JAVA_LONG, ADDRESS));
-            postThreadMessage = dc(linker, user32, "PostThreadMessageW",
-                    FunctionDescriptor.of(JAVA_INT, JAVA_INT, JAVA_INT, JAVA_LONG, JAVA_LONG));
-            getModuleHandle = dc(linker, kernel32, "GetModuleHandleW", FunctionDescriptor.of(ADDRESS, ADDRESS));
-            getCurrentThreadId = dc(linker, kernel32, "GetCurrentThreadId", FunctionDescriptor.of(JAVA_INT));
-            mapVirtualKey = dc(linker, user32, "MapVirtualKeyW", FunctionDescriptor.of(JAVA_INT, JAVA_INT, JAVA_INT));
-            getKeyboardLayout = dc(linker, user32, "GetKeyboardLayout", FunctionDescriptor.of(ADDRESS, JAVA_INT));
-            getKeyState = dc(linker, user32, "GetKeyState", FunctionDescriptor.of(JAVA_SHORT, JAVA_INT));
-            toUnicodeEx = dc(linker, user32, "ToUnicodeEx", FunctionDescriptor.of(JAVA_INT,
-                    JAVA_INT, JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, JAVA_INT, ADDRESS));
 
             pointBuffer = arena.allocate(POINT);
-            rawInputBuffer = arena.allocate(64);
-            rawInputSize = arena.allocate(JAVA_INT);
-            keyStateBuffer = arena.allocate(256);
-            uniBuffer = arena.allocate(16); // up to 8 UTF-16 units (2 bytes each) per keystroke
 
-            MemorySegment wndProcStub = makeWndProcStub(linker);
-            startPumpThread(linker, wndProcStub);
+            // RawInput (wheel, raw motion, typed text) is process-scoped, so the hub owns it and fans each
+            // report into this instance via acceptRawMouse/acceptChars. Never register RawInput from here.
+            WindowsRawInputHub.register(this);
         } catch (BackendException e) {
             throw e;
         } catch (RuntimeException e) {
@@ -202,197 +141,32 @@ public final class WindowsInputBackend implements InputBackend {
         }
     }
 
-    @SuppressWarnings("restricted")
-    private MemorySegment makeWndProcStub(Linker linker) throws BackendException {
-        try {
-            MethodHandle handle = MethodHandles.lookup().findVirtual(
-                    WindowsInputBackend.class, "wndProc",
-                    MethodType.methodType(long.class, MemorySegment.class, int.class, long.class, long.class))
-                    .bindTo(this);
-            return linker.upcallStub(handle,
-                    FunctionDescriptor.of(JAVA_LONG, ADDRESS, JAVA_INT, JAVA_LONG, JAVA_LONG), arena);
-        } catch (ReflectiveOperationException e) {
-            throw new BackendException("Failed to create WndProc upcall stub", e);
-        }
-    }
 
-    @SuppressWarnings("restricted")
-    private void startPumpThread(Linker linker, MemorySegment wndProcStub) throws BackendException {
-        CountDownLatch ready = new CountDownLatch(1);
-        String className = "TactrollerRawInput" + CLASS_SEQ.incrementAndGet();
-        pumpThread = new Thread(() -> runPump(className, wndProcStub, ready), "tactroller-win-msgpump");
-        pumpThread.setDaemon(true);
-        pumpThread.start();
-        try {
-            ready.await();
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new BackendException("Interrupted starting message pump", e);
-        }
-        if (pumpInitError != null) {
-            throw new BackendException("Message pump initialisation failed", pumpInitError);
-        }
-    }
-
-    @SuppressWarnings("restricted")
-    private void runPump(String className, MemorySegment wndProcStub, CountDownLatch ready) {
-        try (Arena pump = Arena.ofConfined()) {
-            pumpThreadId = (int) getCurrentThreadId.invokeExact();
-            MemorySegment hInstance = (MemorySegment) getModuleHandle.invokeExact(MemorySegment.NULL);
-            MemorySegment classNameSeg = wide(pump, className);
-
-            // WNDCLASSEXW (80 bytes): cbSize@0, lpfnWndProc@8, hInstance@24, lpszClassName@64.
-            MemorySegment wc = pump.allocate(80);
-            wc.set(JAVA_INT, 0, 80);
-            wc.set(ADDRESS, 8, wndProcStub);
-            wc.set(ADDRESS, 24, hInstance);
-            wc.set(ADDRESS, 64, classNameSeg);
-            short atom = (short) registerClassEx.invokeExact(wc);
-            if (atom == 0) {
-                throw new IllegalStateException("RegisterClassExW failed");
-            }
-
-            MemorySegment hwnd = (MemorySegment) createWindowEx.invokeExact(
-                    0, classNameSeg, wide(pump, "tactroller"), 0, 0, 0, 0, 0,
-                    MemorySegment.ofAddress(HWND_MESSAGE), MemorySegment.NULL, hInstance, MemorySegment.NULL);
-            if (hwnd.equals(MemorySegment.NULL)) {
-                throw new IllegalStateException("CreateWindowExW (message-only) failed");
-            }
-            messageHwnd = hwnd;
-
-            // Two RAWINPUTDEVICEs (16 bytes each): mouse (for wheel/relative motion) and keyboard (for typed
-            // text). usUsagePage@0, usUsage@2, dwFlags@4, hwndTarget@8. INPUTSINK so we receive input even when
-            // this message-only window is not focused (focus gating happens later, at emit time).
-            MemorySegment rid = pump.allocate(32);
-            rid.set(JAVA_SHORT, 0, (short) 0x01);  // generic desktop
-            rid.set(JAVA_SHORT, 2, (short) 0x02);  // mouse
-            rid.set(JAVA_INT, 4, RIDEV_INPUTSINK);
-            rid.set(ADDRESS, 8, hwnd);
-            rid.set(JAVA_SHORT, 16, (short) 0x01); // generic desktop
-            rid.set(JAVA_SHORT, 18, (short) 0x06); // keyboard
-            rid.set(JAVA_INT, 20, RIDEV_INPUTSINK);
-            rid.set(ADDRESS, 24, hwnd);
-            int ok = (int) registerRawInputDevices.invokeExact(rid, 2, 16);
-            if (ok == 0) {
-                throw new IllegalStateException("RegisterRawInputDevices failed");
-            }
-        } catch (Throwable t) {
-            pumpInitError = t;
-            ready.countDown();
-            return;
-        }
-        ready.countDown();
-
-        // Message loop. GetMessageW returns 0 on WM_QUIT, -1 on error.
-        try (Arena msgArena = Arena.ofConfined()) {
-            MemorySegment msg = msgArena.allocate(48);
-            int r;
-            while ((r = (int) getMessage.invokeExact(msg, MemorySegment.NULL, 0, 0)) != 0) {
-                if (r == -1) {
-                    break;
-                }
-                int ignoredT = (int) translateMessage.invokeExact(msg);
-                long ignoredD = (long) dispatchMessage.invokeExact(msg);
-            }
-        } catch (Throwable t) {
-            pumpInitError = t;
-        } finally {
-            try {
-                if (!messageHwnd.equals(MemorySegment.NULL)) {
-                    int ignored = (int) destroyWindow.invokeExact(messageHwnd);
-                    messageHwnd = MemorySegment.NULL;
-                }
-            } catch (Throwable ignored) {
-                // best effort
-            }
-        }
-    }
-
-    /** Window procedure (runs on the pump thread). Accumulates raw mouse deltas and wheel notches. */
-    @SuppressWarnings({"restricted", "unused"})
-    private long wndProc(MemorySegment hwnd, int msg, long wParam, long lParam) {
-        try {
-            if (msg == WM_INPUT) {
-                MemorySegment hRawInput = MemorySegment.ofAddress(lParam);
-                rawInputSize.set(JAVA_INT, 0, 64);
-                int n = (int) getRawInputData.invokeExact(
-                        hRawInput, RID_INPUT, rawInputBuffer, rawInputSize, RAWINPUTHEADER_SIZE);
-                int dwType = n > 0 ? rawInputBuffer.get(JAVA_INT, 0) : -1;
-                if (dwType == RIM_TYPEMOUSE) {
-                    int usFlags = rawInputBuffer.get(JAVA_SHORT, 24) & 0xFFFF;
-                    int usButtonFlags = rawInputBuffer.get(JAVA_SHORT, 28) & 0xFFFF;
-                    short usButtonData = rawInputBuffer.get(JAVA_SHORT, 30);
-                    int lLastX = rawInputBuffer.get(JAVA_INT, 36);
-                    int lLastY = rawInputBuffer.get(JAVA_INT, 40);
-                    if ((usFlags & MOUSE_MOVE_ABSOLUTE) == 0) {
-                        rawDx.addAndGet(lLastX);
-                        rawDy.addAndGet(lLastY);
-                    }
-                    if ((usButtonFlags & RI_MOUSE_WHEEL) != 0) {
-                        scrollUnitsY.addAndGet(usButtonData);
-                    }
-                    if ((usButtonFlags & RI_MOUSE_HWHEEL) != 0) {
-                        scrollUnitsX.addAndGet(usButtonData);
-                    }
-                } else if (dwType == RIM_TYPEKEYBOARD) {
-                    // RAWKEYBOARD begins at offset 24: MakeCode@24, Flags@26, Reserved@28, VKey@30, Message@32.
-                    int flags = rawInputBuffer.get(JAVA_SHORT, 26) & 0xFFFF;
-                    int vKey = rawInputBuffer.get(JAVA_SHORT, 30) & 0xFFFF;
-                    if ((flags & RI_KEY_BREAK) == 0) { // key-down only
-                        translateToChars(vKey);
-                    }
-                }
-            }
-            return (long) defWindowProc.invokeExact(hwnd, msg, wParam, lParam);
-        } catch (Throwable t) {
-            // Never let an exception cross the native boundary.
-            return 0L;
-        }
-    }
+    // ---- RawInput sink (called on the hub's pump thread) -------------------
 
     /**
-     * Translate a key-down virtual key to text via {@code ToUnicodeEx} and accumulate the produced UTF-16
-     * units (runs on the pump thread). The keyboard state is rebuilt from {@code GetAsyncKeyState}/
-     * {@code GetKeyState} because this message-only window is not the focused queue, so the per-thread state
-     * {@code ToUnicodeEx} would otherwise read is not maintained here. Shortcut chords (Control without Alt)
-     * produce no text — that keeps the command channel ({@code KeyPressed}) and the text channel disjoint —
-     * and control characters (Enter/Tab/Backspace/Escape) are filtered out, as those are handled as keys.
+     * Accept one raw-mouse report fanned from {@link WindowsRawInputHub}: relative motion and wheel notches,
+     * already decoded. Pump thread — the accumulators are atomics drained by the loop/poll thread.
      */
-    @SuppressWarnings("restricted")
-    private void translateToChars(int vKey) throws Throwable {
-        // Skip pure modifiers/fake keys — they never produce text and would waste a ToUnicodeEx call.
-        if (vKey == 0 || vKey == 0xFF || (vKey >= 0xA0 && vKey <= 0xA5) || vKey == VK_SHIFT
-                || vKey == VK_CONTROL || vKey == VK_MENU || vKey == VK_CAPITAL) {
-            return;
+    void acceptRawMouse(int dx, int dy, int wheelX, int wheelY) {
+        if (dx != 0) {
+            rawDx.addAndGet(dx);
         }
-        boolean shift = down(VK_SHIFT);
-        boolean ctrl = down(VK_CONTROL);
-        boolean alt = down(VK_MENU);
-        // Ctrl (without Alt) means a shortcut chord, not typed text. AltGr (== Ctrl+Alt) still types.
-        if (ctrl && !alt) {
-            return;
+        if (dy != 0) {
+            rawDy.addAndGet(dy);
         }
-        keyStateBuffer.fill((byte) 0);
-        if (shift) keyStateBuffer.set(JAVA_BYTE, VK_SHIFT, (byte) 0x80);
-        if (ctrl) keyStateBuffer.set(JAVA_BYTE, VK_CONTROL, (byte) 0x80);
-        if (alt) keyStateBuffer.set(JAVA_BYTE, VK_MENU, (byte) 0x80);
-        if ((((short) getKeyState.invokeExact(VK_CAPITAL)) & TOGGLED_MASK) != 0) {
-            keyStateBuffer.set(JAVA_BYTE, VK_CAPITAL, (byte) TOGGLED_MASK);
+        if (wheelX != 0) {
+            scrollUnitsX.addAndGet(wheelX);
         }
+        if (wheelY != 0) {
+            scrollUnitsY.addAndGet(wheelY);
+        }
+    }
 
-        int scan = (int) mapVirtualKey.invokeExact(vKey, MAPVK_VK_TO_VSC);
-        MemorySegment hkl = (MemorySegment) getKeyboardLayout.invokeExact(0);
-        int rc = (int) toUnicodeEx.invokeExact(vKey, scan, keyStateBuffer, uniBuffer, 8, 0, hkl);
-        if (rc <= 0) {
-            return; // 0 = no translation; -1 = dead key (buffered by the OS for the next keystroke)
-        }
+    /** Accept typed UTF-16 units fanned from {@link WindowsRawInputHub}. Pump thread. */
+    void acceptChars(CharSequence produced) {
         synchronized (charLock) {
-            for (int i = 0; i < rc; i++) {
-                char c = (char) (uniBuffer.get(JAVA_SHORT, i * 2L) & 0xFFFF);
-                if (c >= 0x20 && c != 0x7F) { // drop control chars — those ride the KeyPressed channel
-                    charBuf.append(c);
-                }
-            }
+            charBuf.append(produced);
         }
     }
 
@@ -580,6 +354,38 @@ public final class WindowsInputBackend implements InputBackend {
         }
     }
 
+    /**
+     * Whether the cursor lies inside the attached window's client rect — the <b>positional</b> routing gate
+     * (wheel, pointer). Uses {@code ScreenToClient} + {@code GetClientRect} rather than
+     * {@code WindowFromPoint}, so the answer is about <em>this</em> window's geometry only: with overlapping
+     * windows both may report true, and the consumer's own hit-testing resolves the overlap.
+     */
+    @Override
+    @SuppressWarnings("restricted")
+    public boolean isPointerInClient() {
+        long hwnd = attachedHwnd;
+        if (hwnd == 0L) {
+            return true;
+        }
+        try (Arena a = Arena.ofConfined()) {
+            MemorySegment pt = a.allocate(POINT);
+            if ((int) getCursorPos.invokeExact(pt) == 0) {
+                return false;
+            }
+            int ignored = (int) screenToClient.invokeExact(MemorySegment.ofAddress(hwnd), pt);
+            int x = pt.get(JAVA_INT, 0);
+            int y = pt.get(JAVA_INT, 4);
+            MemorySegment rect = a.allocate(16);   // RECT: left@0, top@4, right@8, bottom@12
+            if ((int) getClientRect.invokeExact(MemorySegment.ofAddress(hwnd), rect) == 0) {
+                return false;
+            }
+            return x >= rect.get(JAVA_INT, 0) && x < rect.get(JAVA_INT, 8)
+                    && y >= rect.get(JAVA_INT, 4) && y < rect.get(JAVA_INT, 12);
+        } catch (Throwable t) {
+            throw wrap("GetClientRect/ScreenToClient failed", t);
+        }
+    }
+
     @Override
     @SuppressWarnings("restricted")
     public int[] toClient(int screenX, int screenY) {
@@ -640,30 +446,16 @@ public final class WindowsInputBackend implements InputBackend {
     // ---- Teardown ---------------------------------------------------------
 
     @Override
-    @SuppressWarnings("restricted")
     public void close() {
         try {
             clearPointerLock();
         } catch (RuntimeException ignored) {
             // continue teardown
         }
-        // Ask the pump thread to quit, then join before releasing the arena (which frees the stub).
-        int tid = pumpThreadId;
-        if (tid != 0) {
-            try {
-                int ignored = (int) postThreadMessage.invokeExact(tid, WM_QUIT, 0L, 0L);
-            } catch (Throwable ignored) {
-                // fall through
-            }
-        }
-        if (pumpThread != null) {
-            try {
-                pumpThread.join(1_000);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-            pumpThread = null;
-        }
+        // Leave the process hub; it tears its pump down once the last backend is gone. Because the hub's
+        // lifetime is independent of any instance, closing whichever window opened first cannot leave the
+        // surviving windows deaf to wheel and typed text.
+        WindowsRawInputHub.unregister(this);
         if (arena != null) {
             arena.close();
             arena = null;

@@ -27,6 +27,27 @@ import java.util.Set;
  *
  * <p>Pure with respect to input acquisition — it knows nothing about where frames come from, so it is
  * trivially testable. {@link TactrollerInputBridge} wraps it to pull frames from a live Tactroller.
+ *
+ * <h2>Routing: which events belong to this window</h2>
+ *
+ * <p>Several OS input channels are <b>process-wide</b>, not per-window: on Windows, RawInput (wheel, typed
+ * text) is registered once per process, and key/pointer state is polled globally. A multi-window process
+ * therefore sees <em>every</em> window's share of those signals on <em>every</em> backend. Publishing them
+ * unfiltered puts one physical keystroke on two windows' buses — which is the bug this gate exists to
+ * prevent. This class is the one seam where scope is corrected, so no GUI downstream needs to know:
+ *
+ * <ul>
+ *   <li><b>Focal</b> channels (keys, typed characters) carry no position, so they belong to the focused
+ *       window: gated on {@link InputFrame#focused()}.</li>
+ *   <li><b>Positional</b> channels (wheel, pointer motion, buttons) belong to the window under the cursor:
+ *       gated on {@link InputFrame#pointerInClient()}. Overlapping windows may both pass this gate; the
+ *       consumer's own hit-testing resolves that.</li>
+ *   <li><b>Ungated:</b> focus changes (the gate's own signal) and pointer <em>position</em> State, which is
+ *       a passive latest-value read rather than a delivered event.</li>
+ * </ul>
+ *
+ * <p>A windowless backend reports {@code true} for both gates, so single-window and headless setups behave
+ * exactly as they did before the gates existed.
  */
 public final class InputPublisher {
 
@@ -60,32 +81,40 @@ public final class InputPublisher {
         return pointer;
     }
 
-    /** Publish one frame's derived edges and pointer state onto the bus. */
+    /** Publish one frame's derived edges and pointer state onto the bus, applying the routing gates. */
     public void publish(InputFrame f) {
         long ts = f.timestampNanos();
+        boolean focal = f.focused();               // keys/text: the focused window's
+        boolean positional = f.pointerInClient();  // wheel/pointer: the window under the cursor
 
-        for (Key k : f.pressedKeys()) {
-            bus.publish(events, new InputEvent.KeyPressed(k, ts));
+        if (focal) {
+            for (Key k : f.pressedKeys()) {
+                bus.publish(events, new InputEvent.KeyPressed(k, ts));
+            }
+            for (Key k : f.releasedKeys()) {
+                bus.publish(events, new InputEvent.KeyReleased(k, ts));
+            }
         }
-        for (Key k : f.releasedKeys()) {
-            bus.publish(events, new InputEvent.KeyReleased(k, ts));
-        }
-        for (MouseButton btn : f.pressedButtons()) {
-            bus.publish(events, new InputEvent.ButtonPressed(btn, f.pointerX(), f.pointerY(), ts));
-        }
-        for (MouseButton btn : f.releasedButtons()) {
-            bus.publish(events, new InputEvent.ButtonReleased(btn, f.pointerX(), f.pointerY(), ts));
-        }
+        if (positional) {
+            for (MouseButton btn : f.pressedButtons()) {
+                bus.publish(events, new InputEvent.ButtonPressed(btn, f.pointerX(), f.pointerY(), ts));
+            }
+            for (MouseButton btn : f.releasedButtons()) {
+                bus.publish(events, new InputEvent.ButtonReleased(btn, f.pointerX(), f.pointerY(), ts));
+            }
 
-        ScrollDelta scroll = f.scroll();
-        if (!scroll.isZero()) {
-            bus.publish(events, new InputEvent.Scrolled(scroll.x(), scroll.y(), f.pointerX(), f.pointerY(), ts));
+            ScrollDelta scroll = f.scroll();
+            if (!scroll.isZero()) {
+                bus.publish(events, new InputEvent.Scrolled(scroll.x(), scroll.y(), f.pointerX(), f.pointerY(), ts));
+            }
         }
 
         // Typed text (layout-resolved code points) — the lossless text channel, one event per code point,
-        // kept strictly separate from the KeyPressed command channel above.
-        for (int cp : f.typedChars()) {
-            bus.publish(events, new InputEvent.CharTyped(cp, ts));
+        // kept strictly separate from the KeyPressed command channel above. Focal: text goes where focus is.
+        if (focal) {
+            for (int cp : f.typedChars()) {
+                bus.publish(events, new InputEvent.CharTyped(cp, ts));
+            }
         }
 
         // Relative motion is a lossless "must-sum" signal (each frame's delta matters and consumers add them
@@ -94,7 +123,7 @@ public final class InputPublisher {
         // backend's relative-motion accumulator, so consumers must read motion from the bus, never poll
         // pollPointerDelta() in parallel (that second drain steals the delta; see the render-loop contract).
         PointerDelta motion = f.motion();
-        if (!motion.isZero()) {
+        if (positional && !motion.isZero()) {
             bus.publish(events, new InputEvent.PointerMoved(
                     f.pointerX(), f.pointerY(), motion.dx(), motion.dy(), ts));
         }

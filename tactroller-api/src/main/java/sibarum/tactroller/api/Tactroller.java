@@ -196,6 +196,7 @@ public final class Tactroller implements AutoCloseable {
      */
     public synchronized InputFrame snapshot() throws BackendException {
         boolean focused = backend.isFocused();
+        boolean pointerInClient = backend.isPointerInClient();
         ScrollDelta scroll = backend.drainScroll();
         int[] chars = backend.drainChars();
         PointerState p = backend.pollPointer();
@@ -222,7 +223,7 @@ public final class Tactroller implements AutoCloseable {
                 keys, pressedKeys, releasedKeys,
                 buttons, pressedBtn, releasedBtn,
                 Modifier.from(keys),
-                xy[0], xy[1], motion, scroll, focused, now, chars);
+                xy[0], xy[1], motion, scroll, focused, now, chars, pointerInClient);
 
         snapPrevKeys = keys;
         snapPrevButtons = buttons;

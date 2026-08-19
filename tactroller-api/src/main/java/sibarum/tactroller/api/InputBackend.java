@@ -111,8 +111,25 @@ public interface InputBackend extends AutoCloseable {
     /**
      * @return whether the attached window currently holds input focus. Windowless backends report
      *         {@code true} (nothing to gate against).
+     *
+     * <p><b>Routing scope:</b> this is the gate for <em>focal</em> channels — keys and typed characters,
+     * which carry no position and so belong to whichever window has focus. See the channel-scope table in
+     * the module README.
      */
     default boolean isFocused() {
+        return true;
+    }
+
+    /**
+     * @return whether the pointer currently lies within the attached window's client area. Windowless
+     *         backends report {@code true} (nothing to gate against).
+     *
+     * <p><b>Routing scope:</b> this is the gate for <em>positional</em> channels — wheel and pointer
+     * events, which belong to the window under the cursor rather than the focused one. Several OS input
+     * channels are process-wide, so a multi-window process receives every window's share of them on every
+     * backend; without this gate a wheel notch scrolls two windows at once.
+     */
+    default boolean isPointerInClient() {
         return true;
     }
 

@@ -35,7 +35,8 @@ public record InputFrame(
         ScrollDelta scroll,
         boolean focused,
         long timestampNanos,
-        int[] typedChars) {
+        int[] typedChars,
+        boolean pointerInClient) {
 
     public InputFrame {
         heldKeys = Set.copyOf(heldKeys);
@@ -68,6 +69,29 @@ public record InputFrame(
             long timestampNanos) {
         this(heldKeys, pressedKeys, releasedKeys, heldButtons, pressedButtons, releasedButtons, modifiers,
                 pointerX, pointerY, motion, scroll, focused, timestampNanos, InputBackend.NO_CHARS);
+    }
+
+    /**
+     * Backward-compatible constructor predating the positional routing gate: the pointer is reported as
+     * inside the client area, which is the single-window answer.
+     */
+    public InputFrame(
+            Set<Key> heldKeys,
+            Set<Key> pressedKeys,
+            Set<Key> releasedKeys,
+            Set<MouseButton> heldButtons,
+            Set<MouseButton> pressedButtons,
+            Set<MouseButton> releasedButtons,
+            Set<Modifier> modifiers,
+            int pointerX,
+            int pointerY,
+            PointerDelta motion,
+            ScrollDelta scroll,
+            boolean focused,
+            long timestampNanos,
+            int[] typedChars) {
+        this(heldKeys, pressedKeys, releasedKeys, heldButtons, pressedButtons, releasedButtons, modifiers,
+                pointerX, pointerY, motion, scroll, focused, timestampNanos, typedChars, true);
     }
 
     /** @return a copy of the code points typed this frame (empty if none), in order. */

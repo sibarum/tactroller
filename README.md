@@ -127,6 +127,38 @@ the shared event loop drains — so events still come from one place (see below)
 expose the identical API and inherit safe defaults (no scroll, lock unsupported) until their native
 plumbing lands. Text/character + IME events are not yet implemented.
 
+### Channel scope: the one rule to read before adding an input channel
+
+`InputBackend` is a **per-window** abstraction: one instance per window, attached with `attach(NativeWindow)`.
+Several OS input channels are not per-window, and **that mismatch is this codebase's most expensive bug
+shape** — it has already produced one silent, hard-to-diagnose failure (a second window's backend stealing
+RawInput from the first, so the first window's wheel and typing died with no error anywhere).
+
+So every channel carries a declared **scope**, and the scope decides where its code lives and how its events
+are routed:
+
+| Channel | OS scope (Windows) | Where the code lives | Routing |
+|---|---|---|---|
+| Pointer position, buttons, key state | global (`GetCursorPos`, `GetAsyncKeyState` — polled) | per-window backend | positional / focal per event kind |
+| Wheel, raw relative motion, typed text | **per-process** (RawInput: last registration wins) | `WindowsRawInputHub`, fanned to every backend | positional (wheel/motion), focal (text) |
+| Focus (`GetForegroundWindow`) | per-window | per-window backend | always published |
+| Pointer lock, cursor clip/visibility | **global** (`ClipCursor`, `ShowCursor`, `SetCursorPos`) | per-window backend today; only one window may hold it | n/a |
+
+Two rules follow:
+
+1. **Process- or globally-scoped channels are owned once and fanned out.** They belong in the process hub
+   (`WindowsRawInputHub`), never in the per-window backend. `RawInputScopeGuardTest` scans bytecode and fails
+   the build if a process-scoped Win32 symbol is bound anywhere else, naming the symbol and the fix.
+2. **Delivery is gated by event kind, in `InputPublisher` — the one seam.** Because the OS hands every window's
+   share of a process-wide channel to every backend, publishing unfiltered puts one physical keystroke on two
+   windows' buses. *Focal* events (keys, typed text) carry no position and are gated on `isFocused()`;
+   *positional* events (wheel, pointer, buttons) are gated on `isPointerInClient()`. Windowless backends report
+   `true` for both, so single-window and headless setups are unaffected.
+
+When adding a channel, classify it **before** implementing: if the OS scope is wider than one window, it goes
+in the hub and needs a routing decision. Adding a new process-scoped Win32 call also means adding its symbol to
+the guard test's list.
+
 ### How events stay identical across OSes
 
 The event loop lives in `tactroller-api`, not in the platform backends. It samples the backend
