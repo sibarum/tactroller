@@ -56,7 +56,14 @@ public final class InputPublisher {
     private final State<PointerState> pointer;
     private final Committer<PointerState, PointerState> setPointer;
 
+    /** The keys that are modifiers -- the state half of the keyboard, safe to re-assert on focus gain. */
+    private static final Set<Key> MODIFIER_KEYS = Set.of(
+            Key.LEFT_SHIFT, Key.RIGHT_SHIFT, Key.LEFT_CONTROL, Key.RIGHT_CONTROL,
+            Key.LEFT_ALT, Key.RIGHT_ALT, Key.LEFT_SUPER, Key.RIGHT_SUPER);
+
     private boolean prevFocused = true;
+    /** Keys last published as held while focused -- what a consumer currently believes is down. */
+    private Set<Key> heldWhileFocused = Set.of();
 
     public InputPublisher(Atchung bus) {
         this(bus, "tactroller.input");
@@ -129,9 +136,36 @@ public final class InputPublisher {
         }
 
         if (f.focused() != prevFocused) {
+            if (!f.focused()) {
+                // Focus is leaving: from here on the focal gate suppresses this window's key events, so the
+                // release edges for anything still held would never arrive and the consumer would keep it
+                // latched forever. A gate on *delivery* must not desynchronize *state*, so unwind now, while
+                // what is held is still known. Releases are inert -- they cannot fire a command.
+                //
+                // This is not hypothetical: opening a modal dialog with Ctrl+Shift+O and landing focus on
+                // another window left CONTROL and SHIFT latched here, and every Ctrl-only global shortcut
+                // then failed to match (a shortcut compares its modifier set exactly, while a focused
+                // widget's own chords ask "is CONTROL among them?" and kept working -- which is what made
+                // the symptom so lopsided).
+                for (Key k : heldWhileFocused) {
+                    bus.publish(events, new InputEvent.KeyReleased(k, ts));
+                }
+            }
             bus.publish(events, new InputEvent.FocusChanged(f.focused(), ts));
             prevFocused = f.focused();
+            if (f.focused()) {
+                // Focus is arriving: presses that happened while this window was unfocused were suppressed,
+                // so re-assert the modifiers physically held now -- otherwise a chord begun in another window
+                // ("hold Ctrl, click here, press W") sees no CONTROL. Modifiers only: a non-modifier press is
+                // a command, and replaying it would fire an action the user aimed somewhere else.
+                for (Key k : f.heldKeys()) {
+                    if (MODIFIER_KEYS.contains(k)) {
+                        bus.publish(events, new InputEvent.KeyPressed(k, ts));
+                    }
+                }
+            }
         }
+        heldWhileFocused = f.focused() ? f.heldKeys() : Set.of();
 
         PointerState next = new PointerState(f.pointerX(), f.pointerY(), f.heldButtons());
         if (!pointer.value().equals(next)) {

@@ -102,6 +102,76 @@ class InputPublisherTest {
         assertEquals(false, fc.focused());
     }
 
+    /** A frame with explicit held keys, for the focus-transition cases. */
+    private static InputFrame held(Set<Key> heldKeys, boolean focused) {
+        return new InputFrame(heldKeys, Set.of(), Set.of(), Set.of(), Set.of(), Set.of(),
+                Modifier.from(heldKeys), 0, 0, PointerDelta.ZERO, ScrollDelta.ZERO, focused, 1L,
+                new int[0], true);
+    }
+
+    /**
+     * Losing focus must unwind whatever this window believed was held. Otherwise the focal gate suppresses
+     * the release edges and the modifier stays latched forever -- after which every global shortcut whose
+     * modifier set is compared exactly (Ctrl+W, Ctrl+=) silently stops matching, while a focused widget's
+     * own chords, which merely ask whether CONTROL is present, keep working.
+     */
+    @Test
+    void losingFocusReleasesTheKeysItStillBelievesAreHeld() {
+        Atchung bus = Atchung.create();
+        InputPublisher pub = new InputPublisher(bus);
+        List<InputEvent> got = new ArrayList<>();
+        bus.subscribe(pub.events(), got::add);
+
+        // Ctrl+Shift held while focused (as when a chord opens a dialog), then focus leaves.
+        pub.publish(held(Set.of(Key.LEFT_CONTROL, Key.LEFT_SHIFT), true));
+        got.clear();
+        pub.publish(held(Set.of(Key.LEFT_CONTROL, Key.LEFT_SHIFT), false));
+
+        Set<Key> released = got.stream()
+                .filter(e -> e instanceof InputEvent.KeyReleased)
+                .map(e -> ((InputEvent.KeyReleased) e).key())
+                .collect(java.util.stream.Collectors.toSet());
+        assertEquals(Set.of(Key.LEFT_CONTROL, Key.LEFT_SHIFT), released,
+                "both held modifiers must be released when focus leaves, or they latch");
+        assertTrue(got.stream().anyMatch(e -> e instanceof InputEvent.FocusChanged fc && !fc.focused()));
+    }
+
+    /** Regaining focus re-asserts physically-held modifiers, so a chord begun elsewhere still works. */
+    @Test
+    void regainingFocusReassertsHeldModifiersButNotCommands() {
+        Atchung bus = Atchung.create();
+        InputPublisher pub = new InputPublisher(bus);
+        List<InputEvent> got = new ArrayList<>();
+        bus.subscribe(pub.events(), got::add);
+
+        pub.publish(held(Set.of(), false));   // start unfocused
+        got.clear();
+        // Focus arrives while Ctrl and the W key are both physically down.
+        pub.publish(held(Set.of(Key.LEFT_CONTROL, Key.W), true));
+
+        Set<Key> pressed = got.stream()
+                .filter(e -> e instanceof InputEvent.KeyPressed)
+                .map(e -> ((InputEvent.KeyPressed) e).key())
+                .collect(java.util.stream.Collectors.toSet());
+        assertEquals(Set.of(Key.LEFT_CONTROL), pressed,
+                "modifiers are state and must be re-asserted; W is a command and must not be replayed");
+    }
+
+    /** No transition, no synthetic traffic: the steady state stays exactly as before. */
+    @Test
+    void steadyFocusPublishesNoSyntheticKeyEvents() {
+        Atchung bus = Atchung.create();
+        InputPublisher pub = new InputPublisher(bus);
+        List<InputEvent> got = new ArrayList<>();
+        bus.subscribe(pub.events(), got::add);
+
+        pub.publish(held(Set.of(Key.LEFT_CONTROL), true));
+        got.clear();
+        pub.publish(held(Set.of(Key.LEFT_CONTROL), true));
+
+        assertTrue(got.isEmpty(), "a steady focused frame with no edges must publish nothing, got " + got);
+    }
+
     @Test
     void publishesKeyAndButtonEdgesAsEvents() {
         Atchung bus = Atchung.create();
