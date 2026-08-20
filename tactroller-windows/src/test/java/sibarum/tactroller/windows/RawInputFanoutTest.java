@@ -1,6 +1,7 @@
 package sibarum.tactroller.windows;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 import org.junit.jupiter.api.condition.EnabledOnOs;
 import org.junit.jupiter.api.condition.OS;
 import sibarum.tactroller.api.ScrollDelta;
@@ -27,10 +28,14 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * pump and fanning what arrives into every live instance; these tests hold that invariant down.
  *
  * <p>Real input is injected with {@code SendInput}, so this exercises the actual OS delivery path rather
- * than a stub. Windows-only, and it moves the real cursor/wheel — hence the deliberately small,
- * self-contained events.
+ * than a stub. That injection is <b>desktop-wide</b>: it goes to whatever window has focus, not to this
+ * process, so an ordinary build must not run it -- a stray wheel notch (or worse, a stray chord) lands in
+ * whatever the developer is using. Hence opt-in via {@code -Dtactroller.injectInput=true}, ideally on an
+ * idle machine or CI box. Run it after touching the hub, the pump, or the fan-out.
  */
 @EnabledOnOs(OS.WINDOWS)
+@EnabledIfSystemProperty(named = "tactroller.injectInput", matches = "true",
+        disabledReason = "injects real input into the desktop; opt in with -Dtactroller.injectInput=true")
 class RawInputFanoutTest {
 
     private static final int INPUT_MOUSE = 0;
