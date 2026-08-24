@@ -64,6 +64,8 @@ public final class InputPublisher {
     private boolean prevFocused = true;
     /** Keys last published as held while focused -- what a consumer currently believes is down. */
     private Set<Key> heldWhileFocused = Set.of();
+    /** Buttons whose press this publisher delivered -- what a consumer currently believes is down. */
+    private Set<MouseButton> heldSincePress = Set.of();
 
     public InputPublisher(Atchung bus) {
         this(bus, "tactroller.input");
@@ -106,10 +108,26 @@ public final class InputPublisher {
             for (MouseButton btn : f.pressedButtons()) {
                 bus.publish(events, new InputEvent.ButtonPressed(btn, f.pointerX(), f.pointerY(), ts));
             }
-            for (MouseButton btn : f.releasedButtons()) {
+        }
+        // A button RELEASE is deliberately not behind the positional gate, and this is the same rule the focus
+        // unwind below states for keys: a gate on *delivery* must not desynchronize *state*. Press the pointer
+        // inside this window, drag out past its edge, let go -- the release edge is in the frame (the backend
+        // polls buttons whatever the pointer is over), but the gate would drop it, and the consumer would keep
+        // the button latched forever. In a GUI that means a drag that never ends: the plot stays stuck to the
+        // pointer until a fresh click somewhere inside resets it.
+        //
+        // Ungating is safe for the reason a release is always safe -- it is inert, it can only end things. What
+        // it must not do is invent one, so a release is delivered only for a button whose PRESS this publisher
+        // delivered. That is also what keeps two windows out of each other's business: press inside window A
+        // and release over window B, and only A ever published the press, so only A publishes the release.
+        for (MouseButton btn : f.releasedButtons()) {
+            if (heldSincePress.contains(btn)) {
                 bus.publish(events, new InputEvent.ButtonReleased(btn, f.pointerX(), f.pointerY(), ts));
             }
+        }
+        heldSincePress = nowHeld(heldSincePress, f, positional);
 
+        if (positional) {
             ScrollDelta scroll = f.scroll();
             if (!scroll.isZero()) {
                 bus.publish(events, new InputEvent.Scrolled(scroll.x(), scroll.y(), f.pointerX(), f.pointerY(), ts));
@@ -171,5 +189,24 @@ public final class InputPublisher {
         if (!pointer.value().equals(next)) {
             pointer.commit(setPointer, next);
         }
+    }
+
+    /**
+     * What a consumer believes is down after this frame: whatever it believed, less anything released, plus
+     * anything pressed <em>inside the client</em>. A press outside belongs to another window, so it is not
+     * added — which is what makes the ungated release above unable to fire for a press this publisher never
+     * delivered.
+     */
+    private static Set<MouseButton> nowHeld(Set<MouseButton> before, InputFrame f, boolean positional) {
+        if (before.isEmpty() && (!positional || f.pressedButtons().isEmpty())) {
+            return Set.of();
+        }
+        java.util.EnumSet<MouseButton> held = java.util.EnumSet.noneOf(MouseButton.class);
+        held.addAll(before);
+        held.removeAll(f.releasedButtons());
+        if (positional) {
+            held.addAll(f.pressedButtons());
+        }
+        return held.isEmpty() ? Set.of() : Set.copyOf(held);
     }
 }

@@ -86,6 +86,75 @@ class InputPublisherTest {
                 "keys are focal, not positional — they still belong to the focused window");
     }
 
+    /** A pointer frame: what is held, the edges, and whether the pointer is over this window. */
+    private static InputFrame buttons(Set<MouseButton> heldBtn, Set<MouseButton> pressedBtn,
+                                      Set<MouseButton> releasedBtn, boolean pointerInClient) {
+        return new InputFrame(Set.of(), Set.of(), Set.of(), heldBtn, pressedBtn, releasedBtn,
+                Set.of(), 5, 6, PointerDelta.ZERO, new ScrollDelta(0, 0), true, 1L,
+                new int[0], pointerInClient);
+    }
+
+    /**
+     * The positional gate must not swallow a release. Press inside, drag out past the window's edge, let go:
+     * the backend polls buttons wherever the pointer is, so the release edge is in the frame — but gating it
+     * away leaves the consumer believing the button is still down, which in a GUI is a drag that never ends.
+     *
+     * <p>This is the button half of what {@link #losingFocusReleasesTheKeysItStillBelievesAreHeld} does for
+     * keys, and it was missed for the same reason it is easy to miss: the gate is right for presses.
+     */
+    @Test
+    void aReleaseReachesTheWindowThatSawThePressEvenOutsideIt() {
+        Atchung bus = Atchung.create();
+        InputPublisher pub = new InputPublisher(bus);
+        List<InputEvent> got = new ArrayList<>();
+        bus.subscribe(pub.events(), got::add);
+
+        pub.publish(buttons(Set.of(MouseButton.LEFT), Set.of(MouseButton.LEFT), Set.of(), true));
+        assertTrue(got.stream().anyMatch(e -> e instanceof InputEvent.ButtonPressed),
+                "the press happened inside the window, so it is this window's");
+
+        got.clear();
+        // The pointer has left, and the button comes up out there.
+        pub.publish(buttons(Set.of(), Set.of(), Set.of(MouseButton.LEFT), false));
+        assertTrue(got.stream().anyMatch(e -> e instanceof InputEvent.ButtonReleased),
+                "the release must arrive, or whatever the press started never ends");
+    }
+
+    /**
+     * And it must not invent one. Only a button whose press this publisher delivered may be released by it —
+     * otherwise pressing in one window and releasing over another would end a gesture in both.
+     */
+    @Test
+    void aReleaseIsNotInventedForAPressThisWindowNeverSaw() {
+        Atchung bus = Atchung.create();
+        InputPublisher pub = new InputPublisher(bus);
+        List<InputEvent> got = new ArrayList<>();
+        bus.subscribe(pub.events(), got::add);
+
+        // Pressed while the pointer was over some other window: gated away, so this window saw nothing.
+        pub.publish(buttons(Set.of(MouseButton.LEFT), Set.of(MouseButton.LEFT), Set.of(), false));
+        assertTrue(got.stream().noneMatch(e -> e instanceof InputEvent.ButtonPressed));
+
+        pub.publish(buttons(Set.of(), Set.of(), Set.of(MouseButton.LEFT), false));
+        assertTrue(got.stream().noneMatch(e -> e instanceof InputEvent.ButtonReleased),
+                "a release with no matching press is a message about somebody else's gesture");
+    }
+
+    /** A release is delivered once: the belief is updated with it, so a later frame has nothing left to end. */
+    @Test
+    void aReleaseDoesNotRepeat() {
+        Atchung bus = Atchung.create();
+        InputPublisher pub = new InputPublisher(bus);
+        List<InputEvent> got = new ArrayList<>();
+        bus.subscribe(pub.events(), got::add);
+
+        pub.publish(buttons(Set.of(MouseButton.LEFT), Set.of(MouseButton.LEFT), Set.of(), true));
+        pub.publish(buttons(Set.of(), Set.of(), Set.of(MouseButton.LEFT), false));
+        got.clear();
+        pub.publish(buttons(Set.of(), Set.of(), Set.of(MouseButton.LEFT), false));
+        assertTrue(got.stream().noneMatch(e -> e instanceof InputEvent.ButtonReleased));
+    }
+
     /** Focus changes are the gate's own signal, so they must never be gated away. */
     @Test
     void focusChangesArePublishedRegardlessOfGates() {
