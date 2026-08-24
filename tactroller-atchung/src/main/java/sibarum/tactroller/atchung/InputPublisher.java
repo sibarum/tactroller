@@ -39,12 +39,21 @@ import java.util.Set;
  * <ul>
  *   <li><b>Focal</b> channels (keys, typed characters) carry no position, so they belong to the focused
  *       window: gated on {@link InputFrame#focused()}.</li>
- *   <li><b>Positional</b> channels (wheel, pointer motion, buttons) belong to the window under the cursor:
- *       gated on {@link InputFrame#pointerInClient()}. Overlapping windows may both pass this gate; the
- *       consumer's own hit-testing resolves that.</li>
+ *   <li><b>Positional</b> channels (wheel, button presses, pointer motion) belong to the window under the
+ *       cursor: gated on {@link InputFrame#pointerInClient()}. Overlapping windows may both pass this gate;
+ *       the consumer's own hit-testing resolves that.</li>
+ *   <li><b>Held by the gesture:</b> once a window's press has been delivered, that window owns the gesture
+ *       until it ends, so the pointer <em>motion</em> and the eventual <em>release</em> go to it wherever the
+ *       pointer has wandered — this is pointer capture, and without it a drag freezes and then lurches the
+ *       moment it crosses the window's edge.</li>
  *   <li><b>Ungated:</b> focus changes (the gate's own signal) and pointer <em>position</em> State, which is
  *       a passive latest-value read rather than a delivered event.</li>
  * </ul>
+ *
+ * <p>The second and third bullets are the same rule twice: <b>a gate on delivery must not desynchronize
+ * state.</b> A gate decides whose window an event belongs to, and it is right about that — but a consumer's
+ * belief about what is held, and a gesture already in flight, are state rather than delivery, and dropping the
+ * events that would have ended them leaves that state wrong forever.
  *
  * <p>A windowless backend reports {@code true} for both gates, so single-window and headless setups behave
  * exactly as they did before the gates existed.
@@ -147,8 +156,15 @@ public final class InputPublisher {
         // snapshot's captured delta is surfaced — publishing it here keeps snapshot() the only drain of the
         // backend's relative-motion accumulator, so consumers must read motion from the bus, never poll
         // pollPointerDelta() in parallel (that second drain steals the delta; see the render-loop contract).
+        // Motion follows the press, not the pointer. While this window owns a held button it owns the gesture,
+        // so the moves keep coming even once the pointer has left -- which is what pointer capture means, and
+        // what every drag contract above this already promises ("MOVE events keep arriving while the button is
+        // held even if the pointer leaves"). Gating them at the window edge instead freezes a drag the moment
+        // it overshoots, and then the whole frozen excursion arrives at once as the release's delta: the thing
+        // being dragged sits still and then jumps. Owning the release without owning the motion fixed half a
+        // gesture and made the other half worse.
         PointerDelta motion = f.motion();
-        if (positional && !motion.isZero()) {
+        if ((positional || !heldSincePress.isEmpty()) && !motion.isZero()) {
             bus.publish(events, new InputEvent.PointerMoved(
                     f.pointerX(), f.pointerY(), motion.dx(), motion.dy(), ts));
         }

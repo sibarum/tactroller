@@ -140,6 +140,48 @@ class InputPublisherTest {
                 "a release with no matching press is a message about somebody else's gesture");
     }
 
+    /** A pointer frame carrying motion, with the gate and the held buttons set explicitly. */
+    private static InputFrame moved(Set<MouseButton> heldBtn, Set<MouseButton> pressedBtn,
+                                    PointerDelta motion, boolean pointerInClient) {
+        return new InputFrame(Set.of(), Set.of(), Set.of(), heldBtn, pressedBtn, Set.of(),
+                Set.of(), 5, 6, motion, new ScrollDelta(0, 0), true, 1L, new int[0], pointerInClient);
+    }
+
+    /**
+     * Motion follows the press, not the pointer. A window holding a button owns the gesture until the release,
+     * so the moves keep arriving once the pointer has left it — which is what pointer capture means, and what
+     * every drag contract above this promises. Gating them at the window edge freezes a drag the moment it
+     * overshoots, and the frozen distance then arrives all at once as the release's delta.
+     */
+    @Test
+    void motionFollowsAHeldButtonOutOfTheWindow() {
+        Atchung bus = Atchung.create();
+        InputPublisher pub = new InputPublisher(bus);
+        List<InputEvent> got = new ArrayList<>();
+        bus.subscribe(pub.events(), got::add);
+
+        pub.publish(moved(Set.of(MouseButton.LEFT), Set.of(MouseButton.LEFT), PointerDelta.ZERO, true));
+        got.clear();
+
+        // Dragged out past the edge, button still down.
+        pub.publish(moved(Set.of(MouseButton.LEFT), Set.of(), new PointerDelta(12, -4), false));
+        assertTrue(got.stream().anyMatch(e -> e instanceof InputEvent.PointerMoved),
+                "a drag that leaves the window must keep being a drag");
+    }
+
+    /** With no button held it is just a pointer over somebody else's window, and stays gated. */
+    @Test
+    void motionOutsideWithNoButtonHeldIsStillGated() {
+        Atchung bus = Atchung.create();
+        InputPublisher pub = new InputPublisher(bus);
+        List<InputEvent> got = new ArrayList<>();
+        bus.subscribe(pub.events(), got::add);
+
+        pub.publish(moved(Set.of(), Set.of(), new PointerDelta(12, -4), false));
+        assertTrue(got.stream().noneMatch(e -> e instanceof InputEvent.PointerMoved),
+                "motion over another window is not this window's business");
+    }
+
     /** A release is delivered once: the belief is updated with it, so a later frame has nothing left to end. */
     @Test
     void aReleaseDoesNotRepeat() {
