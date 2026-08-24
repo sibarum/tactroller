@@ -102,6 +102,8 @@ public final class WindowsInputBackend implements InputBackend {
 
     private volatile long attachedHwnd;
     private volatile PointerLockMode lockMode;
+    /** Where the cursor was when the lock was taken, in screen pixels, so unlocking can put it back. */
+    private volatile int[] preLockCursor;
 
     @Override
     public String name() {
@@ -290,6 +292,10 @@ public final class WindowsInputBackend implements InputBackend {
             rawDx.set(0);
             rawDy.set(0);
             if (!wasLocked) {
+                // Remembered before anything moves it, so that unlocking is invisible. A lock held for a whole
+                // session does not care where the cursor was; a lock held for the length of one drag cares very
+                // much, because letting go somewhere the user did not put the pointer is its own bug.
+                preLockCursor = screenCursorPoint();
                 int ignored = (int) showCursor.invokeExact(0); // hide (best effort)
             }
             if (mode == PointerLockMode.RECENTER) {
@@ -308,6 +314,12 @@ public final class WindowsInputBackend implements InputBackend {
         }
         lockMode = null;
         try {
+            int[] back = preLockCursor;
+            preLockCursor = null;
+            if (back != null) {
+                // Put it back before showing it, so the cursor never appears at the centre and then jumps.
+                int moved = (int) setCursorPos.invokeExact(back[0], back[1]);
+            }
             int ignored = (int) showCursor.invokeExact(1); // show
         } catch (Throwable t) {
             throw wrap("failed to restore cursor", t);
@@ -416,6 +428,18 @@ public final class WindowsInputBackend implements InputBackend {
             return dpi > 0 ? dpi / 96.0 : 1.0;
         } catch (Throwable t) {
             return 1.0;
+        }
+    }
+
+    /** Where the cursor is now, in screen coordinates — what a lock remembers so unlocking can undo itself. */
+    @SuppressWarnings("restricted")
+    private int[] screenCursorPoint() throws Throwable {
+        try (Arena a = Arena.ofConfined()) {
+            MemorySegment pt = a.allocate(POINT);
+            if ((int) getCursorPos.invokeExact(pt) == 0) {
+                return null;                       // no answer is better than a wrong place to put it back
+            }
+            return new int[]{pt.get(JAVA_INT, 0), pt.get(JAVA_INT, 4)};
         }
     }
 

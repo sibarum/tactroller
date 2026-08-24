@@ -168,7 +168,12 @@ public interface InputBackend extends AutoCloseable {
         throw new UnsupportedOperationException(name() + " does not support pointer lock");
     }
 
-    /** Release the pointer and restore the cursor. No-op if not locked. */
+    /**
+     * Release the pointer and restore the cursor, to where it was when the lock was taken. No-op if not locked.
+     *
+     * <p>Restoring the position is part of the contract and not a nicety: a lock that lasts one gesture must be
+     * invisible either side of it.
+     */
     default void clearPointerLock() {
         // no-op by default
     }
