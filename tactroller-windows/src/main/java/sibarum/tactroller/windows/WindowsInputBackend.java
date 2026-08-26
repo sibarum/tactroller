@@ -38,7 +38,7 @@ import static java.lang.foreign.ValueLayout.JAVA_SHORT;
  * <p><b>This class is the per-window half.</b> Absolute pointer position, key and button state come from
  * polling {@code user32.dll} ({@code GetCursorPos}, {@code GetAsyncKeyState}), and window attachment supplies
  * client-relative coordinates ({@code ScreenToClient}) plus the two routing gates: {@link #isFocused()} for
- * focal channels (keys, typed text) and {@link #isPointerInClient()} for positional ones (wheel, pointer).
+ * focal channels (keys, typed text) and {@link #isPointerTarget()} for positional ones (wheel, pointer).
  *
  * <p>Scroll wheel, raw relative motion and typed text cannot be polled on Windows — they arrive via RawInput,
  * which is <b>process-scoped</b>: one registration per usage pair wins for the entire process. That half lives
@@ -97,6 +97,8 @@ public final class WindowsInputBackend implements InputBackend {
     private MethodHandle clientToScreen;
     private MethodHandle getForegroundWindow;
     private MethodHandle getClientRect;
+    private MethodHandle windowFromPoint;
+    private MethodHandle isChild;
     private MethodHandle getSystemMetrics;
     private MethodHandle getDpiForWindow;
 
@@ -128,6 +130,9 @@ public final class WindowsInputBackend implements InputBackend {
             clientToScreen = dc(linker, user32, "ClientToScreen", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS));
             getForegroundWindow = dc(linker, user32, "GetForegroundWindow", FunctionDescriptor.of(ADDRESS));
             getClientRect = dc(linker, user32, "GetClientRect", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS));
+            // POINT is passed by value (8 bytes, one register on x64), so the layout goes in the descriptor.
+            windowFromPoint = dc(linker, user32, "WindowFromPoint", FunctionDescriptor.of(ADDRESS, POINT));
+            isChild = dc(linker, user32, "IsChild", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS));
             getSystemMetrics = dc(linker, user32, "GetSystemMetrics", FunctionDescriptor.of(JAVA_INT, JAVA_INT));
             getDpiForWindow = dc(linker, user32, "GetDpiForWindow", FunctionDescriptor.of(JAVA_INT, ADDRESS));
 
@@ -367,14 +372,29 @@ public final class WindowsInputBackend implements InputBackend {
     }
 
     /**
-     * Whether the cursor lies inside the attached window's client rect — the <b>positional</b> routing gate
-     * (wheel, pointer). Uses {@code ScreenToClient} + {@code GetClientRect} rather than
-     * {@code WindowFromPoint}, so the answer is about <em>this</em> window's geometry only: with overlapping
-     * windows both may report true, and the consumer's own hit-testing resolves the overlap.
+     * Whether this window is the pointer's target — the <b>positional</b> routing gate (wheel, pointer). Two
+     * questions, and both have to be asked:
+     *
+     * <ul>
+     *   <li><b>Is the cursor in my client area?</b> {@code ScreenToClient} + {@code GetClientRect}. This is
+     *       about geometry alone, so every window of an overlapping stack answers yes.</li>
+     *   <li><b>Is anything drawn over me there?</b> {@code WindowFromPoint}, which returns the topmost
+     *       window at a screen point. Nothing above this backend can answer that: a GUI hit-tests its own
+     *       tree and cannot see another window's pixels, so asking only the first question routed one wheel
+     *       notch to every overlapping window at once — they all scrolled together.</li>
+     * </ul>
+     *
+     * <p>{@code WindowFromPoint} reads the desktop's stacking order, which is global — but it is a
+     * <em>query</em>, not a registration or a mutation, so it stays here with the other global reads
+     * ({@code GetCursorPos}, {@code GetForegroundWindow}) rather than moving to the hub: what it answers is
+     * a strictly per-window question, and the hub fans one answer to everybody by construction.
+     *
+     * <p>It also skips hidden and disabled windows, which is the answer we want in both cases: a window
+     * disabled behind a modal dialog is not a scroll target either.
      */
     @Override
     @SuppressWarnings("restricted")
-    public boolean isPointerInClient() {
+    public boolean isPointerTarget() {
         long hwnd = attachedHwnd;
         if (hwnd == 0L) {
             return true;
@@ -382,6 +402,9 @@ public final class WindowsInputBackend implements InputBackend {
         try (Arena a = Arena.ofConfined()) {
             MemorySegment pt = a.allocate(POINT);
             if ((int) getCursorPos.invokeExact(pt) == 0) {
+                return false;
+            }
+            if (!topmostAt(hwnd, pt)) {
                 return false;
             }
             int ignored = (int) screenToClient.invokeExact(MemorySegment.ofAddress(hwnd), pt);
@@ -396,6 +419,26 @@ public final class WindowsInputBackend implements InputBackend {
         } catch (Throwable t) {
             throw wrap("GetClientRect/ScreenToClient failed", t);
         }
+    }
+
+    /**
+     * Whether {@code hwnd} is what the desktop shows at screen point {@code pt} — itself, or one of its
+     * children. A child counts because a window may host the very surface it draws on (a swapchain child, an
+     * OS control inside the client area); the pointer is still this window's.
+     *
+     * @param pt a {@code POINT} in screen coordinates, left untouched
+     */
+    @SuppressWarnings("restricted")
+    private boolean topmostAt(long hwnd, MemorySegment pt) throws Throwable {
+        MemorySegment top = (MemorySegment) windowFromPoint.invokeExact(pt);
+        long topHwnd = top.address();
+        if (topHwnd == 0L) {
+            return false;
+        }
+        if (topHwnd == hwnd) {
+            return true;
+        }
+        return (int) isChild.invokeExact(MemorySegment.ofAddress(hwnd), MemorySegment.ofAddress(topHwnd)) != 0;
     }
 
     @Override

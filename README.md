@@ -142,9 +142,10 @@ are routed:
 | Pointer position, buttons, key state | global (`GetCursorPos`, `GetAsyncKeyState` — polled) | per-window backend | positional / focal per event kind |
 | Wheel, raw relative motion, typed text | **per-process** (RawInput: last registration wins) | `WindowsRawInputHub`, fanned to every backend | positional (wheel/motion), focal (text) |
 | Focus (`GetForegroundWindow`) | per-window | per-window backend | always published |
+| Pointer target (`WindowFromPoint` + client rect) | global read, per-window answer | per-window backend | n/a — it *is* the positional gate |
 | Pointer lock, cursor clip/visibility | **global** (`ClipCursor`, `ShowCursor`, `SetCursorPos`) | per-window backend today; only one window may hold it | n/a |
 
-Two rules follow:
+Three rules follow:
 
 1. **Process- or globally-scoped channels are owned once and fanned out.** They belong in the process hub
    (`WindowsRawInputHub`), never in the per-window backend. `RawInputScopeGuardTest` scans bytecode and fails
@@ -152,8 +153,13 @@ Two rules follow:
 2. **Delivery is gated by event kind, in `InputPublisher` — the one seam.** Because the OS hands every window's
    share of a process-wide channel to every backend, publishing unfiltered puts one physical keystroke on two
    windows' buses. *Focal* events (keys, typed text) carry no position and are gated on `isFocused()`;
-   *positional* events (wheel, pointer, buttons) are gated on `isPointerInClient()`. Windowless backends report
+   *positional* events (wheel, pointer, buttons) are gated on `isPointerTarget()`. Windowless backends report
    `true` for both, so single-window and headless setups are unaffected.
+3. **A gate answers the whole question, including occlusion.** Exactly one window is the pointer's target, and
+   only the OS's stacking order says which — a consumer hit-tests its own tree and cannot see that another
+   window is drawn over it. `isPointerTarget()` therefore asks both "is the cursor in my client rect?" *and*
+   "is anything above me there?" (`WindowFromPoint`). Asking only the first is how one wheel notch came to
+   scroll every overlapping window at once; `PointerTargetGateTest` stacks two real windows and holds that down.
 
 When adding a channel, classify it **before** implementing: if the OS scope is wider than one window, it goes
 in the hub and needs a routing decision. Adding a new process-scoped Win32 call also means adding its symbol to

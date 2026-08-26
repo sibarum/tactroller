@@ -36,7 +36,7 @@ public record InputFrame(
         boolean focused,
         long timestampNanos,
         int[] typedChars,
-        boolean pointerInClient) {
+        boolean pointerTarget) {
 
     public InputFrame {
         heldKeys = Set.copyOf(heldKeys);
@@ -72,8 +72,8 @@ public record InputFrame(
     }
 
     /**
-     * Backward-compatible constructor predating the positional routing gate: the pointer is reported as
-     * inside the client area, which is the single-window answer.
+     * Backward-compatible constructor predating the positional routing gate: this window is reported as the
+     * pointer's target, which is the single-window answer.
      */
     public InputFrame(
             Set<Key> heldKeys,

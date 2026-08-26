@@ -29,9 +29,9 @@ class InputPublisherTest {
 
     /** A frame with both routing gates set explicitly — the multi-window shape. */
     private static InputFrame routed(Set<Key> pressed, Set<MouseButton> pressedBtn, ScrollDelta scroll,
-                                     int[] typed, boolean focused, boolean pointerInClient) {
+                                     int[] typed, boolean focused, boolean pointerTarget) {
         return new InputFrame(Set.of(), pressed, Set.of(), Set.of(), pressedBtn, Set.of(),
-                Set.of(), 5, 6, PointerDelta.ZERO, scroll, focused, 1L, typed, pointerInClient);
+                Set.of(), 5, 6, PointerDelta.ZERO, scroll, focused, 1L, typed, pointerTarget);
     }
 
     /**
@@ -88,10 +88,10 @@ class InputPublisherTest {
 
     /** A pointer frame: what is held, the edges, and whether the pointer is over this window. */
     private static InputFrame buttons(Set<MouseButton> heldBtn, Set<MouseButton> pressedBtn,
-                                      Set<MouseButton> releasedBtn, boolean pointerInClient) {
+                                      Set<MouseButton> releasedBtn, boolean pointerTarget) {
         return new InputFrame(Set.of(), Set.of(), Set.of(), heldBtn, pressedBtn, releasedBtn,
                 Set.of(), 5, 6, PointerDelta.ZERO, new ScrollDelta(0, 0), true, 1L,
-                new int[0], pointerInClient);
+                new int[0], pointerTarget);
     }
 
     /**
@@ -142,9 +142,9 @@ class InputPublisherTest {
 
     /** A pointer frame carrying motion, with the gate and the held buttons set explicitly. */
     private static InputFrame moved(Set<MouseButton> heldBtn, Set<MouseButton> pressedBtn,
-                                    PointerDelta motion, boolean pointerInClient) {
+                                    PointerDelta motion, boolean pointerTarget) {
         return new InputFrame(Set.of(), Set.of(), Set.of(), heldBtn, pressedBtn, Set.of(),
-                Set.of(), 5, 6, motion, new ScrollDelta(0, 0), true, 1L, new int[0], pointerInClient);
+                Set.of(), 5, 6, motion, new ScrollDelta(0, 0), true, 1L, new int[0], pointerTarget);
     }
 
     /**

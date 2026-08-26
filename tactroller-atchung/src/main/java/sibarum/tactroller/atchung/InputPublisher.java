@@ -40,8 +40,8 @@ import java.util.Set;
  *   <li><b>Focal</b> channels (keys, typed characters) carry no position, so they belong to the focused
  *       window: gated on {@link InputFrame#focused()}.</li>
  *   <li><b>Positional</b> channels (wheel, button presses, pointer motion) belong to the window under the
- *       cursor: gated on {@link InputFrame#pointerInClient()}. Overlapping windows may both pass this gate;
- *       the consumer's own hit-testing resolves that.</li>
+ *       cursor: gated on {@link InputFrame#pointerTarget()}. Exactly one window passes that gate, occlusion
+ *       included — a consumer cannot resolve an overlap, because its hit-testing sees only its own tree.</li>
  *   <li><b>Held by the gesture:</b> once a window's press has been delivered, that window owns the gesture
  *       until it ends, so the pointer <em>motion</em> and the eventual <em>release</em> go to it wherever the
  *       pointer has wandered — this is pointer capture, and without it a drag freezes and then lurches the
@@ -103,7 +103,7 @@ public final class InputPublisher {
     public void publish(InputFrame f) {
         long ts = f.timestampNanos();
         boolean focal = f.focused();               // keys/text: the focused window's
-        boolean positional = f.pointerInClient();  // wheel/pointer: the window under the cursor
+        boolean positional = f.pointerTarget();  // wheel/pointer: the window under the cursor
 
         if (focal) {
             for (Key k : f.pressedKeys()) {

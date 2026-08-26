@@ -99,7 +99,7 @@ class RawInputFanoutTest {
         try {
             backend.initialize();
             assertTrue(backend.isFocused(), "an unattached backend must not gate focal events");
-            assertTrue(backend.isPointerInClient(), "an unattached backend must not gate positional events");
+            assertTrue(backend.isPointerTarget(), "an unattached backend must not gate positional events");
         } finally {
             backend.close();
         }

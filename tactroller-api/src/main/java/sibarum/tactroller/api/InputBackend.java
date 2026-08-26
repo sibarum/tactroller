@@ -121,15 +121,23 @@ public interface InputBackend extends AutoCloseable {
     }
 
     /**
-     * @return whether the pointer currently lies within the attached window's client area. Windowless
-     *         backends report {@code true} (nothing to gate against).
+     * @return whether this window is the pointer's <b>target</b>: the cursor lies within its client area
+     *         <em>and</em> no window covers it there. Windowless backends report {@code true} (nothing to
+     *         gate against).
      *
      * <p><b>Routing scope:</b> this is the gate for <em>positional</em> channels — wheel and pointer
      * events, which belong to the window under the cursor rather than the focused one. Several OS input
      * channels are process-wide, so a multi-window process receives every window's share of them on every
      * backend; without this gate a wheel notch scrolls two windows at once.
+     *
+     * <p><b>Occlusion is the backend's question, not a consumer's.</b> At most one window is the pointer's
+     * target at any moment, and what decides it is the OS's stacking order — which nothing above this layer
+     * can see: a GUI hit-tests its <em>own</em> tree, and no amount of hit-testing there reveals that
+     * another window is drawn over it. A gate that only asks "is the cursor inside my rectangle?" therefore
+     * opens on every window of an overlapping stack, and one wheel notch scrolls all of them. A backend
+     * with a window attached must answer the whole question.
      */
-    default boolean isPointerInClient() {
+    default boolean isPointerTarget() {
         return true;
     }
 
