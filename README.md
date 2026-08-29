@@ -86,6 +86,65 @@ try (Tactroller t = Tactroller.open()) {
 }                       // close() stops the loop and releases native resources
 ```
 
+### Drag gestures
+
+`DragGesture` adds three events — `DragStarted`, `DragOver`, `DragEnded` — derived from the event stream.
+It is **purely additive**: presses, releases and whatever you derive from them are untouched, so existing
+click handling keeps working and never needs to learn that drags exist.
+
+```java
+DragGesture drags = new DragGesture();          // LEFT button, 2px, 100ms
+
+t.addListener(e -> {
+    for (DragEvent d : drags.feed(e)) {
+        switch (d) {
+            case DragEvent.DragStarted s -> payload = pick(s.startX(), s.startY());
+            case DragEvent.DragOver o    -> ghost.moveTo(o.offsetX(), o.offsetY());
+            case DragEvent.DragEnded x   -> {
+                if (x.cancelled()) ghost.hide();                       // Escape
+                else dropTargetAt(x.x(), x.y()).accept(payload);       // the drop
+            }
+        }
+    }
+});
+```
+
+**The two thresholds do different jobs**, and collapsing them into one "distance *and* time" test gets a
+common gesture wrong — press, flick 50px in 40ms, release is a drag, but a strict conjunction calls it a
+click reported 50px from the press. So:
+
+- **Distance (2px) decides *whether* it was a drag.** Evaluated at release too, whatever the elapsed time,
+  so a fast flick is a drag. A release that met the distance but not the hold emits `DragStarted`
+  immediately followed by `DragEnded`, so a consumer still gets the one event where it builds the payload.
+- **Time (100ms) decides *when* the drag becomes visible.** It debounces `DragStarted` so hand tremor
+  during a click does not visibly begin one. Its cost is latency — at the default 125 Hz loop, 100ms is
+  about twelve frames — so `holdMillis = 0` gives distance-only recognition, which is what the platform
+  toolkits do.
+
+Because there is a hold threshold there is a clock, and `DragGesture` has none of its own — no thread, no
+wall-clock read. It advances on event timestamps plus `drags.tick(System.nanoTime())`, which you call once
+per frame. `tick` exists because the stream can go silent: cross the distance, then hold the pointer
+perfectly still, and no further event arrives to promote the drag. It is optional — without it the gesture
+still resolves correctly at release, just all at once.
+
+Every drag event carries the position twice: `x`/`y` for hit-testing a drop target, and `offsetX`/`offsetY`
+— motion accumulated since the press — for moving the dragged thing. They agree while unlocked; under
+`PointerLockMode.RAW` only the offset moves.
+
+It lives in `tactroller-api` and needs no native code, because a drag is a *gesture* derived from events the
+API already produces — it therefore behaves identically on every platform for the same reason the event loop
+does. It relies on pointer capture (motion and release follow the press, wherever the pointer goes), which
+the delivery gate provides. It deliberately stops short of resolving a *drop target*: that means hit-testing
+a scene graph this library cannot see, so the recognizer hands over the drop point and the consumer resolves
+it.
+
+Focus loss does not cancel a drag — motion and release are positional and keep arriving, so the gesture
+still completes. Escape is the cancel path, and `DragEnded.cancelled()` is what separates it from a drop.
+
+For drag-and-drop with *other applications* (files in from Explorer, payloads out to it), see
+[docs/dnd-design.md](docs/dnd-design.md) — a different channel with no polled form, planned as a standalone
+`tactroller-dnd` module rather than an `InputBackend` channel.
+
 ### Mouselook, scroll, window & focus
 
 ```java
