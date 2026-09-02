@@ -6,6 +6,10 @@ import java.util.ServiceLoader;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.Consumer;
 
+import sibarum.probe.Lane;
+import sibarum.probe.Probe;
+import sibarum.probe.Zone;
+
 /**
  * The middleware entry point. Resolves the single platform {@link InputBackend} on the classpath,
  * initialises it, and exposes an OS-agnostic API for one-shot polling and continuous event
@@ -195,6 +199,17 @@ public final class Tactroller implements AutoCloseable {
      * snapshot reports no edges (it establishes the baseline).
      */
     public synchronized InputFrame snapshot() throws BackendException {
+        // The whole per-frame OS poll, in one span. Every backend call below is a native downcall, and on a
+        // bad day one of them is the frame: a raw-input hub that has fallen behind, a keyboard state query
+        // that blocks. Timed here rather than per call because the frame loop pays for the sum, and because
+        // eight nested spans on a path that runs sixty times a second is a report nobody reads.
+        try (Zone z = Probe.zone(Lane.INPUT, "snapshot")) {
+            return takeSnapshot();
+        }
+    }
+
+    /** The body of {@link #snapshot()}, split out so the probe span wraps all of it. */
+    private InputFrame takeSnapshot() throws BackendException {
         boolean focused = backend.isFocused();
         boolean pointerTarget = backend.isPointerTarget();
         ScrollDelta scroll = backend.drainScroll();
@@ -224,6 +239,14 @@ public final class Tactroller implements AutoCloseable {
                 buttons, pressedBtn, releasedBtn,
                 Modifier.from(keys),
                 xy[0], xy[1], motion, scroll, focused, now, chars, pointerTarget);
+
+        // How much actually happened this frame. A frame loop that is busy with nothing to do and a frame
+        // loop drowning in edges look identical from the outside and are opposite problems; this is the line
+        // that tells them apart, and its peak is the input storm.
+        if (Probe.ON) {
+            Probe.count(Lane.INPUT, "edges", pressedKeys.size() + releasedKeys.size()
+                    + pressedBtn.size() + releasedBtn.size() + chars.length);
+        }
 
         snapPrevKeys = keys;
         snapPrevButtons = buttons;

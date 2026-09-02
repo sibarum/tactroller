@@ -4,7 +4,11 @@ import sibarum.atchung.Atchung;
 import sibarum.atchung.State;
 import sibarum.atchung.Topic;
 import sibarum.tactroller.api.BackendException;
+import sibarum.probe.Lane;
+import sibarum.probe.Probe;
+import sibarum.probe.Zone;
 import sibarum.tactroller.api.InputEvent;
+import sibarum.tactroller.api.InputFrame;
 import sibarum.tactroller.api.PointerState;
 import sibarum.tactroller.api.Tactroller;
 
@@ -42,6 +46,12 @@ public final class TactrollerInputBridge {
 
     /** Snapshot Tactroller and publish this frame's edges and pointer state. Call once per frame. */
     public void pump() throws BackendException {
-        publisher.publish(tactroller.snapshot());
+        // Two spans, not one, and the split is the point: "snapshot" (inside Tactroller) is what the OS cost,
+        // "publish" is what the bus fan-out cost. An input frame that ran long is one or the other, and the
+        // fix for each is nothing like the fix for the other.
+        InputFrame frame = tactroller.snapshot();
+        try (Zone z = Probe.zone(Lane.INPUT, "publish")) {
+            publisher.publish(frame);
+        }
     }
 }

@@ -164,13 +164,35 @@ public final class DragGesture {
      */
     public List<DragEvent> feed(InputEvent event) {
         Objects.requireNonNull(event, "event");
-        return switch (event) {
+        return report(switch (event) {
             case InputEvent.ButtonPressed p -> onPress(p);
             case InputEvent.PointerMoved m -> onMove(m);
             case InputEvent.ButtonReleased r -> onRelease(r);
             case InputEvent.KeyPressed k -> onKey(k);
             default -> List.of();
-        };
+        });
+    }
+
+    /**
+     * Count what the recognizer decided, by kind, and hand the list straight back.
+     *
+     * <p>A drag that "does not work" is nearly always a recognizer that never emitted a DragStarted - the
+     * hold elapsed on a frame nobody ticked, or the distance was met after the button came up. Counting the
+     * kinds turns that from a debugging session into a line: starts, overs and ends that do not balance are
+     * the whole diagnosis.
+     */
+    private static List<DragEvent> report(List<DragEvent> events) {
+        if (sibarum.probe.Probe.ON) {
+            for (DragEvent e : events) {
+                sibarum.probe.Probe.count(sibarum.probe.Lane.INPUT,
+                        switch (e) {
+                            case DragEvent.DragStarted s -> "drag started";
+                            case DragEvent.DragOver o -> "drag over";
+                            case DragEvent.DragEnded x -> "drag ended";
+                        });
+            }
+        }
+        return events;
     }
 
     /**
@@ -182,7 +204,7 @@ public final class DragGesture {
      *                 ({@link System#nanoTime()})
      */
     public List<DragEvent> tick(long nowNanos) {
-        return promote(nowNanos);
+        return report(promote(nowNanos));
     }
 
     /**
