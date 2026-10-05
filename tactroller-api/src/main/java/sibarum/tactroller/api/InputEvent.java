@@ -39,8 +39,9 @@ public sealed interface InputEvent {
     /**
      * The pointer changed position.
      *
-     * @param x  new absolute position, virtual-screen pixels
-     * @param y  new absolute position, virtual-screen pixels
+     * @param x  new absolute position, in the {@link CoordinateSpace} the {@link Tactroller} is set to
+     *           (virtual-screen pixels unless it was changed)
+     * @param y  new absolute position, in the same space as {@code x}
      * @param dx change from the previous sample
      * @param dy change from the previous sample
      */

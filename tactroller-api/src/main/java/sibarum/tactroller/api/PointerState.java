@@ -3,12 +3,13 @@ package sibarum.tactroller.api;
 import java.util.Set;
 
 /**
- * An immutable snapshot of the pointer at one instant: its position in virtual-screen
- * coordinates and the set of buttons currently held.
+ * An immutable snapshot of the pointer at one instant: its position in the {@link Tactroller}'s
+ * configured {@link CoordinateSpace} and the set of buttons currently held.
  *
- * @param x       horizontal position in virtual-screen pixels (origin is platform-defined,
- *                typically the top-left of the primary display)
- * @param y       vertical position in virtual-screen pixels
+ * @param x       horizontal position in the configured {@link CoordinateSpace} — virtual-screen
+ *                pixels unless it was changed (origin platform-defined, typically the primary
+ *                display's top-left)
+ * @param y       vertical position, in the same space as {@code x}
  * @param buttons the buttons held down at the moment of capture; never {@code null}
  */
 public record PointerState(int x, int y, Set<MouseButton> buttons) {
