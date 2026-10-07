@@ -597,7 +597,8 @@ public final class WindowsInputBackend implements InputBackend {
         m.put(Key.NUMPAD_SUBTRACT, 0x6D);
         m.put(Key.NUMPAD_DECIMAL, 0x6E);
         m.put(Key.NUMPAD_DIVIDE, 0x6F);
-        m.put(Key.NUMPAD_ENTER, 0x0D); // VK_RETURN; not distinguishable from ENTER via GetAsyncKeyState
+        // No NUMPAD_ENTER: it is VK_RETURN too, and GetAsyncKeyState cannot tell the two apart. Mapping both made
+        // one press of either Enter two key-downs, ENTER and NUMPAD_ENTER; unmapped, the keypad's Enter is ENTER.
 
         // OEM punctuation (US layout).
         m.put(Key.MINUS, 0xBD);
