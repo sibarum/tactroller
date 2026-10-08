@@ -1,0 +1,40 @@
+{
+  "reflection": [
+    { "type": "sibarum.tactroller.windows.WindowsInputBackend" },
+    {
+      "type": "sibarum.tactroller.windows.WindowsRawInputHub",
+      "methods": [
+        { "name": "wndProc", "parameterTypes": ["java.lang.foreign.MemorySegment", "int", "long", "long"] }
+      ]
+    }
+  ],
+  "resources": [
+    { "glob": "META-INF/services/sibarum.tactroller.api.InputBackend" }
+  ],
+  "foreign": {
+    "upcalls": [
+      { "returnType": "jlong", "parameterTypes": ["void*", "jint", "jlong", "jlong"] }
+    ],
+    "downcalls": [
+        { "returnType": "jint", "parameterTypes": ["void*"] },
+        { "returnType": "jint", "parameterTypes": ["jint", "jint"] },
+        { "returnType": "jshort", "parameterTypes": ["jint"] },
+        { "returnType": "jint", "parameterTypes": ["jint"] },
+        { "returnType": "jint", "parameterTypes": ["void*", "void*"] },
+        { "returnType": "void*", "parameterTypes": [] },
+        { "returnType": "void*", "parameterTypes": ["struct(jint,jint)"] },
+        { "returnType": "jshort", "parameterTypes": ["void*"] },
+        { "returnType": "void*", "parameterTypes": ["jint", "void*", "void*", "jint", "jint", "jint", "jint", "jint", "void*", "void*", "void*", "void*"] },
+        { "returnType": "jlong", "parameterTypes": ["void*", "jint", "jlong", "jlong"] },
+        { "returnType": "jint", "parameterTypes": ["void*", "jint", "jint"] },
+        { "returnType": "jint", "parameterTypes": ["void*", "jint", "void*", "void*", "jint"] },
+        { "returnType": "jint", "parameterTypes": ["void*", "void*", "jint", "jint"] },
+        { "returnType": "jlong", "parameterTypes": ["void*"] },
+        { "returnType": "jint", "parameterTypes": ["jint", "jint", "jlong", "jlong"] },
+        { "returnType": "void*", "parameterTypes": ["void*"] },
+        { "returnType": "jint", "parameterTypes": [] },
+        { "returnType": "void*", "parameterTypes": ["jint"] },
+        { "returnType": "jint", "parameterTypes": ["jint", "jint", "void*", "void*", "jint", "jint", "void*"] }
+      ]
+  }
+}

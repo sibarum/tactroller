@@ -1,0 +1,14 @@
+{
+  "foreign": {
+    "downcalls": [
+        { "returnType": "jint", "parameterTypes": ["void*"] },
+        { "returnType": "jint", "parameterTypes": [] },
+        { "returnType": "void*", "parameterTypes": ["jint"] },
+        { "returnType": "void*", "parameterTypes": ["jint", "void*"] },
+        { "returnType": "jint", "parameterTypes": ["jint"] },
+        { "returnType": "void*", "parameterTypes": ["jint", "jlong"] },
+        { "returnType": "void*", "parameterTypes": ["void*"] },
+        { "returnType": "jlong", "parameterTypes": ["void*"] }
+      ]
+  }
+}
