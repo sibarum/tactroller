@@ -461,6 +461,42 @@ public final class WindowsInputBackend implements InputBackend {
 
     @Override
     @SuppressWarnings("restricted")
+    public int[] toScreen(int clientX, int clientY) {
+        long hwnd = attachedHwnd;
+        if (hwnd == 0L) {
+            return new int[] {clientX, clientY};
+        }
+        try (Arena a = Arena.ofConfined()) {
+            MemorySegment pt = a.allocate(POINT);
+            pt.set(JAVA_INT, 0, clientX);
+            pt.set(JAVA_INT, 4, clientY);
+            int ignored = (int) clientToScreen.invokeExact(MemorySegment.ofAddress(hwnd), pt);
+            return new int[] {pt.get(JAVA_INT, 0), pt.get(JAVA_INT, 4)};
+        } catch (Throwable t) {
+            throw wrap("ClientToScreen failed", t);
+        }
+    }
+
+    @Override
+    public boolean supportsPointerWarp() {
+        return true;
+    }
+
+    @Override
+    public void warpPointer(int screenX, int screenY) throws BackendException {
+        try {
+            if ((int) setCursorPos.invokeExact(screenX, screenY) == 0) {
+                throw new BackendException("SetCursorPos(" + screenX + ", " + screenY + ") was refused");
+            }
+        } catch (BackendException e) {
+            throw e;
+        } catch (Throwable t) {
+            throw wrap("SetCursorPos failed", t);
+        }
+    }
+
+    @Override
+    @SuppressWarnings("restricted")
     public double contentScale() {
         long hwnd = attachedHwnd;
         if (hwnd == 0L) {

@@ -151,6 +151,36 @@ public interface InputBackend extends AutoCloseable {
     }
 
     /**
+     * Convert a point in the attached window's client area (OS logical pixels) to screen space — the inverse of
+     * {@link #toClient}.
+     *
+     * @return the converted point as {@code [screenX, screenY]}; identity if no window is attached
+     */
+    default int[] toScreen(int clientX, int clientY) {
+        return new int[] {clientX, clientY};
+    }
+
+    // ---- Moving the pointer ------------------------------------------------
+
+    /** @return whether this backend can put the cursor somewhere. */
+    default boolean supportsPointerWarp() {
+        return false;
+    }
+
+    /**
+     * Put the cursor at a screen point, as if the user had moved it there.
+     *
+     * <p>For an application that is carrying the pointer along with something it is animating — a card flying back
+     * to where it was picked up, with the hand still on it — and that moves it a step per frame, so the eye follows
+     * one continuous motion. One call is one jump; it is the caller's job not to make one the user can see.
+     *
+     * @throws UnsupportedOperationException if {@link #supportsPointerWarp()} is false
+     */
+    default void warpPointer(int screenX, int screenY) throws BackendException {
+        throw new UnsupportedOperationException(name() + " cannot move the pointer");
+    }
+
+    /**
      * @return the attached window's content scale (DPI / 96 on Windows): 1.0 at 100%, 1.5 at 150%.
      *         Used to convert {@code CLIENT} logical pixels to {@code FRAMEBUFFER} physical pixels.
      *         Returns 1.0 when no window is attached or the backend cannot query DPI.

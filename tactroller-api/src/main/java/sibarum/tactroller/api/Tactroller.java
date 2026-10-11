@@ -329,6 +329,38 @@ public final class Tactroller implements AutoCloseable {
         return backend.isPointerLocked();
     }
 
+    // ---- Moving the pointer -----------------------------------------------
+
+    /** @return whether the backend can put the cursor somewhere. */
+    public boolean supportsPointerWarp() {
+        return backend.supportsPointerWarp();
+    }
+
+    /**
+     * Put the cursor at {@code (x, y)} in the configured {@link CoordinateSpace} — the space positions are reported
+     * in, so a point read from an event can be handed straight back. The next poll reports the move as motion like
+     * any other: the pointer did move, and hover has to follow it.
+     */
+    public void warpPointer(int x, int y) throws BackendException {
+        int[] s = unproject(x, y, coordinateSpace);
+        backend.warpPointer(s[0], s[1]);
+    }
+
+    /** The inverse of {@link #project}: a point in {@code space} back to the screen. */
+    private int[] unproject(int x, int y, CoordinateSpace space) {
+        if (!backend.isWindowAttached()) {
+            return new int[] {x, y};
+        }
+        return switch (space) {
+            case SCREEN -> new int[] {x, y};
+            case CLIENT -> backend.toScreen(x, y);
+            case FRAMEBUFFER -> {
+                double s = backend.contentScale();
+                yield backend.toScreen((int) Math.round(x / s), (int) Math.round(y / s));
+            }
+        };
+    }
+
     // ---- Event listening --------------------------------------------------
 
     public void addListener(InputListener listener) {
