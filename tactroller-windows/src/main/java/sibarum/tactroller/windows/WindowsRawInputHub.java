@@ -70,6 +70,9 @@ final class WindowsRawInputHub {
     private static final int VK_CAPITAL = 0x14;
     private static final int TOGGLED_MASK = 0x01;
     private static final int DOWN_MASK = 0x8000;
+    private static final int VK_PACKET = 0xE7;
+    // ToUnicodeEx wFlags bit 2 (Windows 10 1607+): translate without touching the kernel keyboard state.
+    private static final int TU_NO_STATE_CHANGE = 0x04;
 
     private static final AtomicInteger CLASS_SEQ = new AtomicInteger();
 
@@ -343,13 +346,22 @@ final class WindowsRawInputHub {
      * would otherwise read is not maintained here. Shortcut chords (Control without Alt) produce no text — that
      * keeps the command channel ({@code KeyPressed}) and the text channel disjoint — and control characters
      * (Enter/Tab/Backspace/Escape) are filtered out, as those are handled as keys.
+     *
+     * <p><b>This must not disturb other applications.</b> INPUTSINK delivers every keystroke on the desktop,
+     * including those typed into other programs. {@code ToUnicodeEx} with no flags advances the kernel keyboard
+     * state — dead keys, Alt+numpad entry, injected {@code VK_PACKET} text — which is shared with whatever has
+     * focus, so translating a keystroke meant for another program ate part of it. Hence: nothing is translated
+     * unless one of our windows is in the foreground, and the translation never changes keyboard state.
      */
     @SuppressWarnings("restricted")
     private void translateToChars(int vKey) throws Throwable {
         // Skip pure modifiers/fake keys — they never produce text and would waste a ToUnicodeEx call.
-        if (vKey == 0 || vKey == 0xFF || (vKey >= 0xA0 && vKey <= 0xA5) || vKey == VK_SHIFT
+        if (vKey == 0 || vKey == 0xFF || vKey == VK_PACKET || (vKey >= 0xA0 && vKey <= 0xA5) || vKey == VK_SHIFT
                 || vKey == VK_CONTROL || vKey == VK_MENU || vKey == VK_CAPITAL) {
             return;
+        }
+        if (!anySinkFocused()) {
+            return; // someone else's keystroke: leave it alone
         }
         boolean shift = down(VK_SHIFT);
         boolean ctrl = down(VK_CONTROL);
@@ -368,9 +380,9 @@ final class WindowsRawInputHub {
 
         int scan = (int) mapVirtualKey.invokeExact(vKey, MAPVK_VK_TO_VSC);
         MemorySegment hkl = (MemorySegment) getKeyboardLayout.invokeExact(0);
-        int rc = (int) toUnicodeEx.invokeExact(vKey, scan, keyStateBuffer, uniBuffer, 8, 0, hkl);
+        int rc = (int) toUnicodeEx.invokeExact(vKey, scan, keyStateBuffer, uniBuffer, 8, TU_NO_STATE_CHANGE, hkl);
         if (rc <= 0) {
-            return; // 0 = no translation; -1 = dead key (buffered by the OS for the next keystroke)
+            return; // 0 = no translation; -1 = dead key (not composed: that would mean changing keyboard state)
         }
         StringBuilder produced = new StringBuilder(rc);
         for (int i = 0; i < rc; i++) {
@@ -385,6 +397,16 @@ final class WindowsRawInputHub {
         for (WindowsInputBackend sink : sinks) {
             sink.acceptChars(produced);
         }
+    }
+
+    /** Whether any registered sink's window is the foreground window (pump thread). */
+    private boolean anySinkFocused() {
+        for (WindowsInputBackend sink : sinks) {
+            if (sink.isFocused()) {
+                return true;
+            }
+        }
+        return false;
     }
 
     @SuppressWarnings("restricted")
