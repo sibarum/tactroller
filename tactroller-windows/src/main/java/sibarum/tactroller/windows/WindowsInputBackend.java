@@ -68,6 +68,10 @@ public final class WindowsInputBackend implements InputBackend {
     private static final int VK_LBUTTON = 0x01;
     private static final int VK_RBUTTON = 0x02;
     private static final int VK_MBUTTON = 0x04;
+    private static final int WM_NCHITTEST = 0x0084;
+    // The eight resize-band hit-test codes run contiguously from HTLEFT to HTBOTTOMRIGHT.
+    private static final int HTLEFT = 10;
+    private static final int HTBOTTOMRIGHT = 17;
 
     /** POINT { LONG x; LONG y; } */
     private static final MemoryLayout POINT = MemoryLayout.structLayout(
@@ -101,6 +105,9 @@ public final class WindowsInputBackend implements InputBackend {
     private MethodHandle isChild;
     private MethodHandle getSystemMetrics;
     private MethodHandle getDpiForWindow;
+    private MethodHandle sendMessageW;
+    private MethodHandle getWindowThreadProcessId;
+    private MethodHandle getCurrentThreadId;
 
     private volatile long attachedHwnd;
     private volatile PointerLockMode lockMode;
@@ -135,6 +142,11 @@ public final class WindowsInputBackend implements InputBackend {
             isChild = dc(linker, user32, "IsChild", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS));
             getSystemMetrics = dc(linker, user32, "GetSystemMetrics", FunctionDescriptor.of(JAVA_INT, JAVA_INT));
             getDpiForWindow = dc(linker, user32, "GetDpiForWindow", FunctionDescriptor.of(JAVA_INT, ADDRESS));
+            sendMessageW = dc(linker, user32, "SendMessageW",
+                    FunctionDescriptor.of(JAVA_LONG, ADDRESS, JAVA_INT, JAVA_LONG, JAVA_LONG));
+            getWindowThreadProcessId = dc(linker, user32, "GetWindowThreadProcessId",
+                    FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS));
+            getCurrentThreadId = dc(linker, kernel32, "GetCurrentThreadId", FunctionDescriptor.of(JAVA_INT));
 
             pointBuffer = arena.allocate(POINT);
 
@@ -382,6 +394,11 @@ public final class WindowsInputBackend implements InputBackend {
      *       window at a screen point. Nothing above this backend can answer that: a GUI hit-tests its own
      *       tree and cannot see another window's pixels, so asking only the first question routed one wheel
      *       notch to every overlapping window at once — they all scrolled together.</li>
+     *   <li><b>Is it a resize band?</b> A window that draws its own frame makes its whole rect client area and
+     *       answers {@code WM_NCHITTEST} with resize codes inside it, so the client-rect test passes over the
+     *       grip. The button is polled, so the press that starts a resize would also be a press on whatever the
+     *       GUI drew under the grip — and the resize that follows, a drag across it. The window's own hit-test
+     *       is asked, and a resize band is the window manager's, not the GUI's.</li>
      * </ul>
      *
      * <p>{@code WindowFromPoint} reads the desktop's stacking order, which is global — but it is a
@@ -414,11 +431,33 @@ public final class WindowsInputBackend implements InputBackend {
             if ((int) getClientRect.invokeExact(MemorySegment.ofAddress(hwnd), rect) == 0) {
                 return false;
             }
-            return x >= rect.get(JAVA_INT, 0) && x < rect.get(JAVA_INT, 8)
+            boolean inClient = x >= rect.get(JAVA_INT, 0) && x < rect.get(JAVA_INT, 8)
                     && y >= rect.get(JAVA_INT, 4) && y < rect.get(JAVA_INT, 12);
+            return inClient && !inResizeBand(hwnd);
         } catch (Throwable t) {
             throw wrap("GetClientRect/ScreenToClient failed", t);
         }
+    }
+
+    /**
+     * Whether the window's own {@code WM_NCHITTEST} puts the cursor on one of its resize bands. Asked only from
+     * the window's own thread: there the message is a direct call into its window procedure, while from any
+     * other thread it would wait on that thread's message loop, and a poll must not block on someone else's.
+     */
+    @SuppressWarnings("restricted")
+    private boolean inResizeBand(long hwnd) throws Throwable {
+        MemorySegment w = MemorySegment.ofAddress(hwnd);
+        if ((int) getWindowThreadProcessId.invokeExact(w, MemorySegment.NULL) != (int) getCurrentThreadId.invokeExact()) {
+            return false;
+        }
+        int ok = (int) getCursorPos.invokeExact(pointBuffer);
+        if (ok == 0) {
+            return false;
+        }
+        // lParam is the screen point packed as two signed 16-bit words, as Windows sends it.
+        long lParam = ((pointBuffer.get(JAVA_INT, 4) & 0xFFFFL) << 16) | (pointBuffer.get(JAVA_INT, 0) & 0xFFFFL);
+        long hit = (long) sendMessageW.invokeExact(w, WM_NCHITTEST, 0L, lParam);
+        return hit >= HTLEFT && hit <= HTBOTTOMRIGHT;
     }
 
     /**
