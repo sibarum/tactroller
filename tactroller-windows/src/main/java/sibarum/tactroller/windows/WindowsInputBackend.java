@@ -9,6 +9,7 @@ import sibarum.tactroller.api.PointerDelta;
 import sibarum.tactroller.api.PointerLockMode;
 import sibarum.tactroller.api.PointerState;
 import sibarum.tactroller.api.ScrollDelta;
+import sibarum.tactroller.api.TouchpadContact;
 
 import java.lang.foreign.Arena;
 import java.lang.foreign.FunctionDescriptor;
@@ -21,6 +22,7 @@ import java.lang.invoke.MethodHandles;
 import java.lang.invoke.MethodType;
 import java.util.EnumMap;
 import java.util.EnumSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
@@ -87,6 +89,10 @@ public final class WindowsInputBackend implements InputBackend {
     // Typed characters (UTF-16 units) accumulated on the pump thread, drained by the loop/poll thread.
     private final StringBuilder charBuf = new StringBuilder();
     private final Object charLock = new Object();
+    // The latest touchpad frame (immutable) and when it arrived, published by the pump thread.
+    private volatile List<TouchpadContact> touchpad = List.of();
+    private volatile long touchpadNanos;
+    private static final long TOUCHPAD_STALE_NANOS = 500_000_000L;
 
     private Arena arena;
     private MemorySegment pointBuffer;      // reusable POINT for pollPointer (loop/poll thread)
@@ -189,6 +195,12 @@ public final class WindowsInputBackend implements InputBackend {
         }
     }
 
+    /** Accept a completed frame of touchpad contacts (immutable) fanned from {@link WindowsRawInputHub}. Pump thread. */
+    void acceptTouchpad(List<TouchpadContact> contacts) {
+        touchpadNanos = System.nanoTime();
+        touchpad = contacts;
+    }
+
     // ---- Polling ----------------------------------------------------------
 
     @Override
@@ -266,6 +278,23 @@ public final class WindowsInputBackend implements InputBackend {
             charBuf.setLength(0);
         }
         return s.codePoints().toArray(); // fold any UTF-16 surrogate pairs into single code points
+    }
+
+    @Override
+    public boolean supportsTouchpad() {
+        return WindowsRawInputHub.touchpadRegistered();
+    }
+
+    @Override
+    public List<TouchpadContact> pollTouchpad() {
+        List<TouchpadContact> contacts = touchpad;
+        // A precision touchpad reports continuously while any finger is down, so contacts that have gone quiet were
+        // never lifted as far as we heard -- the device was unplugged, or the machine slept mid-touch. Left alone
+        // they would hold a gesture open forever.
+        if (!contacts.isEmpty() && System.nanoTime() - touchpadNanos > TOUCHPAD_STALE_NANOS) {
+            return List.of();
+        }
+        return contacts;
     }
 
     @Override

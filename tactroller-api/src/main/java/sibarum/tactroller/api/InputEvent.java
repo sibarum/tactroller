@@ -1,5 +1,7 @@
 package sibarum.tactroller.api;
 
+import java.util.List;
+
 /**
  * A single input event, delivered identically on every host OS.
  *
@@ -19,6 +21,7 @@ package sibarum.tactroller.api;
  *     case InputEvent.Scrolled s       -> ...
  *     case InputEvent.CharTyped c      -> ...
  *     case InputEvent.FocusChanged f   -> ...
+ *     case InputEvent.TouchpadChanged t -> ...
  * }
  * }</pre>
  */
@@ -82,4 +85,19 @@ public sealed interface InputEvent {
      * @param focused {@code true} if the window is now focused
      */
     record FocusChanged(boolean focused, long timestampNanos) implements InputEvent {}
+
+    /**
+     * The fingers on the touchpad changed: one landed, lifted or moved. Carries every contact now on the surface,
+     * so the last one received is the whole state; an empty list means the surface is clear. Only emitted by a
+     * backend that {@linkplain Tactroller#supportsTouchpad() reads touchpad contacts}.
+     *
+     * <p>This is the raw channel. For pinches, multi-finger pans and taps, feed these to a {@link TouchpadGesture}.
+     *
+     * @param contacts the contacts on the surface, never {@code null}
+     */
+    record TouchpadChanged(List<TouchpadContact> contacts, long timestampNanos) implements InputEvent {
+        public TouchpadChanged {
+            contacts = List.copyOf(contacts);
+        }
+    }
 }

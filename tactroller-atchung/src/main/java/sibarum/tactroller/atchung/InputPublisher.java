@@ -11,7 +11,9 @@ import sibarum.tactroller.api.MouseButton;
 import sibarum.tactroller.api.PointerDelta;
 import sibarum.tactroller.api.PointerState;
 import sibarum.tactroller.api.ScrollDelta;
+import sibarum.tactroller.api.TouchpadContact;
 
+import java.util.List;
 import java.util.Objects;
 import java.util.Set;
 
@@ -46,6 +48,8 @@ import java.util.Set;
  *       until it ends, so the pointer <em>motion</em> and the eventual <em>release</em> go to it wherever the
  *       pointer has wandered — this is pointer capture, and without it a drag freezes and then lurches the
  *       moment it crosses the window's edge.</li>
+ *   <li><b>Touchpad contacts</b> are positional and held by the touch: delivered while this window is the
+ *       pointer's target, and once delivered, until the surface is clear.</li>
  *   <li><b>Ungated:</b> focus changes (the gate's own signal) and pointer <em>position</em> State, which is
  *       a passive latest-value read rather than a delivered event.</li>
  * </ul>
@@ -75,6 +79,8 @@ public final class InputPublisher {
     private Set<Key> heldWhileFocused = Set.of();
     /** Buttons whose press this publisher delivered -- what a consumer currently believes is down. */
     private Set<MouseButton> heldSincePress = Set.of();
+    /** The touchpad contacts last published -- what a consumer currently believes is on the surface. */
+    private List<TouchpadContact> publishedTouchpad = List.of();
 
     public InputPublisher(Atchung bus) {
         this(bus, "tactroller.input");
@@ -167,6 +173,16 @@ public final class InputPublisher {
         if ((positional || !heldSincePress.isEmpty()) && !motion.isZero()) {
             bus.publish(events, new InputEvent.PointerMoved(
                     f.pointerX(), f.pointerY(), motion.dx(), motion.dy(), ts));
+        }
+
+        // Touchpad contacts are positional -- a pinch belongs to the window under the pointer -- and held by the
+        // touch the way motion is held by a press: once this window has been told fingers are down it owns them
+        // until it has been told the surface is clear. Without that, a gesture whose pointer target changed under
+        // it (a window opening over it, say) would be left mid-flight forever, its lift never delivered.
+        List<TouchpadContact> touch = f.touchpadContacts();
+        if (!touch.equals(publishedTouchpad) && (positional || !publishedTouchpad.isEmpty())) {
+            bus.publish(events, new InputEvent.TouchpadChanged(touch, ts));
+            publishedTouchpad = touch;
         }
 
         if (f.focused() != prevFocused) {

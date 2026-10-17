@@ -1,6 +1,7 @@
 package sibarum.tactroller.api;
 
 import java.util.EnumSet;
+import java.util.List;
 import java.util.Set;
 
 /**
@@ -256,6 +257,33 @@ public interface InputBackend extends AutoCloseable {
      */
     default int[] drainChars() {
         return NO_CHARS;
+    }
+
+    // ---- Touchpad contacts ------------------------------------------------
+
+    /**
+     * @return whether this backend reads raw touchpad contacts. {@code true} means the plumbing exists, not that a
+     *         touchpad is connected: without one {@link #pollTouchpad()} simply stays empty.
+     */
+    default boolean supportsTouchpad() {
+        return false;
+    }
+
+    /**
+     * The fingers on the touchpad now — state, not an accumulator, so reading it consumes nothing and two readers
+     * see the same thing. Empty when the surface is clear, no touchpad is connected, or the backend has no touchpad
+     * plumbing.
+     *
+     * <p>A touchpad is not a per-window device: the backend reports every contact whatever window the pointer is
+     * over, and routing (the contacts belong to the pointer's target, held by the gesture until the surface clears)
+     * happens at publish time, like the wheel's. Backends must make this safe to call from the loop/poll thread
+     * while the native side updates it, typically by publishing an immutable list through a volatile field.
+     *
+     * <p>The OS keeps turning touchpad input into pointer motion, scrolling and system gestures as before; reading
+     * contacts observes them without taking them over.
+     */
+    default List<TouchpadContact> pollTouchpad() {
+        return List.of();
     }
 
     /** Release native resources. Idempotent. */

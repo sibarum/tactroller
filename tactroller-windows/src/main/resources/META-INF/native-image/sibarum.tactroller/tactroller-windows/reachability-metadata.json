@@ -34,7 +34,11 @@
         { "returnType": "void*", "parameterTypes": ["void*"] },
         { "returnType": "jint", "parameterTypes": [] },
         { "returnType": "void*", "parameterTypes": ["jint"] },
-        { "returnType": "jint", "parameterTypes": ["jint", "jint", "void*", "void*", "jint", "jint", "void*"] }
+        { "returnType": "jint", "parameterTypes": ["jint", "jint", "void*", "void*", "jint", "jint", "void*"] },
+        { "returnType": "jint", "parameterTypes": ["void*", "jint", "void*", "void*"] },
+        { "returnType": "jint", "parameterTypes": ["jint", "void*", "void*", "void*"] },
+        { "returnType": "jint", "parameterTypes": ["jint", "jshort", "jshort", "jshort", "void*", "void*", "void*", "jint"] },
+        { "returnType": "jint", "parameterTypes": ["jint", "jshort", "jshort", "void*", "void*", "void*", "void*", "jint"] }
       ]
   }
 }

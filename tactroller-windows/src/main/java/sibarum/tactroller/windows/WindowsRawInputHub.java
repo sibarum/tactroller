@@ -1,6 +1,7 @@
 package sibarum.tactroller.windows;
 
 import sibarum.tactroller.api.BackendException;
+import sibarum.tactroller.api.TouchpadContact;
 
 import java.lang.foreign.Arena;
 import java.lang.foreign.FunctionDescriptor;
@@ -59,6 +60,8 @@ final class WindowsRawInputHub {
     private static final int RAWINPUTHEADER_SIZE = 24;
     private static final int RIM_TYPEMOUSE = 0;
     private static final int RIM_TYPEKEYBOARD = 1;
+    private static final int RIM_TYPEHID = 2;
+    private static final int RAWINPUT_BUFFER_BYTES = 1024; // a mouse/keyboard report is 48; a HID batch is larger
     private static final int RI_KEY_BREAK = 0x01; // key-up flag in RAWKEYBOARD.Flags
     private static final int RI_MOUSE_WHEEL = 0x0400;
     private static final int RI_MOUSE_HWHEEL = 0x0800;
@@ -109,6 +112,13 @@ final class WindowsRawInputHub {
         }
     }
 
+    /** Whether the running hub receives touchpad reports. False when no hub is up. */
+    static boolean touchpadRegistered() {
+        synchronized (LOCK) {
+            return instance != null && instance.touchpadRegistered;
+        }
+    }
+
     /** Visible for tests: whether a hub is currently up (i.e. at least one sink is registered). */
     static boolean isRunning() {
         synchronized (LOCK) {
@@ -119,7 +129,7 @@ final class WindowsRawInputHub {
     private final List<WindowsInputBackend> sinks = new CopyOnWriteArrayList<>();
 
     private final Arena arena;
-    private final MemorySegment rawInputBuffer;   // reusable RAWINPUT buffer (pump thread only)
+    private MemorySegment rawInputBuffer;         // reusable RAWINPUT buffer, grown on demand (pump thread only)
     private final MemorySegment rawInputSize;     // reusable pcbSize (pump thread only)
     private final MemorySegment keyStateBuffer;   // 256-byte keyboard state for ToUnicodeEx (pump thread only)
     private final MemorySegment uniBuffer;        // UTF-16 output for ToUnicodeEx (pump thread only)
@@ -141,6 +151,10 @@ final class WindowsRawInputHub {
     private final MethodHandle getKeyboardLayout;
     private final MethodHandle getKeyState;
     private final MethodHandle toUnicodeEx;
+
+    private final WindowsTouchpadDecoder touchpadDecoder;
+    /** Whether the touchpad usage was registered; a system that refuses it still gets wheel, motion and text. */
+    private volatile boolean touchpadRegistered;
 
     private Thread pumpThread;
     private volatile int pumpThreadId;
@@ -181,7 +195,8 @@ final class WindowsRawInputHub {
             toUnicodeEx = dc(linker, user32, "ToUnicodeEx", FunctionDescriptor.of(JAVA_INT,
                     JAVA_INT, JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, JAVA_INT, ADDRESS));
 
-            rawInputBuffer = arena.allocate(64);
+            rawInputBuffer = arena.allocate(RAWINPUT_BUFFER_BYTES, 8);
+            touchpadDecoder = new WindowsTouchpadDecoder(arena, linker, user32);
             rawInputSize = arena.allocate(JAVA_INT);
             keyStateBuffer = arena.allocate(256);
             uniBuffer = arena.allocate(16); // up to 8 UTF-16 units (2 bytes each) per keystroke
@@ -266,6 +281,16 @@ final class WindowsRawInputHub {
             if (ok == 0) {
                 throw new IllegalStateException("RegisterRawInputDevices failed");
             }
+
+            // Precision touchpads: Digitizer / Touch Pad, delivered as RIM_TYPEHID reports of raw finger contacts.
+            // Registered on its own so that a system refusing it loses only the touchpad. Registering does not take
+            // the touchpad over: the OS goes on turning it into pointer motion, scrolling and system gestures.
+            MemorySegment touchpad = pump.allocate(16);
+            touchpad.set(JAVA_SHORT, 0, (short) 0x0D); // digitizer
+            touchpad.set(JAVA_SHORT, 2, (short) 0x05); // touch pad
+            touchpad.set(JAVA_INT, 4, RIDEV_INPUTSINK);
+            touchpad.set(ADDRESS, 8, hwnd);
+            touchpadRegistered = (int) registerRawInputDevices.invokeExact(touchpad, 1, 16) != 0;
         } catch (Throwable t) {
             pumpInitError = t;
             ready.countDown();
@@ -307,9 +332,19 @@ final class WindowsRawInputHub {
         try {
             if (msg == WM_INPUT) {
                 MemorySegment hRawInput = MemorySegment.ofAddress(lParam);
-                rawInputSize.set(JAVA_INT, 0, 64);
+                rawInputSize.set(JAVA_INT, 0, (int) rawInputBuffer.byteSize());
                 int n = (int) getRawInputData.invokeExact(
                         hRawInput, RID_INPUT, rawInputBuffer, rawInputSize, RAWINPUTHEADER_SIZE);
+                if (n == -1) {
+                    // Too small for this report (a large HID batch): ask for the size needed, grow, read again.
+                    int ignored = (int) getRawInputData.invokeExact(
+                            hRawInput, RID_INPUT, MemorySegment.NULL, rawInputSize, RAWINPUTHEADER_SIZE);
+                    if (rawInputSize.get(JAVA_INT, 0) > rawInputBuffer.byteSize()) {
+                        rawInputBuffer = arena.allocate(rawInputSize.get(JAVA_INT, 0), 8);
+                        n = (int) getRawInputData.invokeExact(
+                                hRawInput, RID_INPUT, rawInputBuffer, rawInputSize, RAWINPUTHEADER_SIZE);
+                    }
+                }
                 int dwType = n > 0 ? rawInputBuffer.get(JAVA_INT, 0) : -1;
                 if (dwType == RIM_TYPEMOUSE) {
                     int usFlags = rawInputBuffer.get(JAVA_SHORT, 24) & 0xFFFF;
@@ -329,6 +364,20 @@ final class WindowsRawInputHub {
                     int vKey = rawInputBuffer.get(JAVA_SHORT, 30) & 0xFFFF;
                     if ((flags & RI_KEY_BREAK) == 0) { // key-down only
                         translateToChars(vKey);
+                    }
+                } else if (dwType == RIM_TYPEHID) {
+                    // RAWHID begins at offset 24: dwSizeHid@24, dwCount@28, then dwCount reports of dwSizeHid bytes.
+                    MemorySegment hDevice = rawInputBuffer.get(ADDRESS, 8);
+                    int size = rawInputBuffer.get(JAVA_INT, 24);
+                    int count = size <= 0 ? 0 : Math.min(rawInputBuffer.get(JAVA_INT, 28), (n - 32) / size);
+                    for (int i = 0; i < count; i++) {
+                        MemorySegment report = rawInputBuffer.asSlice(32 + (long) i * size, size);
+                        List<TouchpadContact> contacts = touchpadDecoder.decode(hDevice, report);
+                        if (contacts != null) {
+                            for (WindowsInputBackend sink : sinks) {
+                                sink.acceptTouchpad(contacts);
+                            }
+                        }
                     }
                 }
             }

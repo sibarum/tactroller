@@ -9,6 +9,7 @@ import sibarum.tactroller.api.Modifier;
 import sibarum.tactroller.api.MouseButton;
 import sibarum.tactroller.api.PointerDelta;
 import sibarum.tactroller.api.ScrollDelta;
+import sibarum.tactroller.api.TouchpadContact;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -353,5 +354,45 @@ class InputPublisherTest {
                 5, 5, ScrollDelta.ZERO, true));
 
         assertTrue(got.isEmpty(), "held-without-edge produces no discrete events");
+    }
+
+    /** A frame carrying touchpad contacts, with the positional gate set explicitly. */
+    private static InputFrame touch(boolean pointerTarget, TouchpadContact... contacts) {
+        return new InputFrame(Set.of(), Set.of(), Set.of(), Set.of(), Set.of(), Set.of(),
+                Set.of(), 5, 6, PointerDelta.ZERO, ScrollDelta.ZERO, true, 1L, new int[0], pointerTarget,
+                List.of(contacts));
+    }
+
+    /**
+     * Touchpad contacts are positional and held by the touch. A window not under the pointer does not get them; a
+     * window that was told fingers are down is told when they lift, wherever the pointer target has gone meanwhile;
+     * and an unchanged surface publishes nothing.
+     */
+    @Test
+    void touchpadContactsGoToThePointerTargetAndAreHeldUntilTheSurfaceClears() {
+        Atchung bus = Atchung.create();
+        InputPublisher pub = new InputPublisher(bus);
+        List<InputEvent> got = new ArrayList<>();
+        bus.subscribe(pub.events(), got::add);
+        TouchpadContact a = new TouchpadContact(1, 40, 30, 0.4, 0.5);
+        TouchpadContact b = new TouchpadContact(2, 60, 30, 0.6, 0.5);
+
+        pub.publish(touch(false, a, b));
+        assertTrue(got.isEmpty(), "fingers down over another window are that window's");
+
+        pub.publish(touch(true, a, b));
+        pub.publish(touch(true, a, b));
+        assertEquals(1, got.size(), "delivered once, then unchanged");
+
+        got.clear();
+        pub.publish(touch(false, a));
+        pub.publish(touch(false));
+        assertEquals(2, got.size(), "held by the touch: the lift arrives even off-target");
+        InputEvent.TouchpadChanged last = (InputEvent.TouchpadChanged) got.get(1);
+        assertTrue(last.contacts().isEmpty());
+
+        got.clear();
+        pub.publish(touch(false, a));
+        assertTrue(got.isEmpty(), "and once clear, the hold is over");
     }
 }

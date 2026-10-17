@@ -1,5 +1,6 @@
 package sibarum.tactroller.api;
 
+import java.util.List;
 import java.util.Set;
 
 /**
@@ -20,6 +21,9 @@ import java.util.Set;
  * and dead-key-resolved text; see {@link InputEvent.CharTyped}), distinct from the {@code KeyPressed}
  * command channel. The array is defensively cloned on construction and read-back; note it is compared
  * by identity in the record's generated {@code equals} (frames are not value-compared in practice).
+ *
+ * <p>{@link #touchpadContacts()} are the fingers on the touchpad at snapshot time (empty when the surface is clear
+ * or the backend reads no touchpad). Feed frames to a {@link TouchpadGesture} for pinches, pans and taps.
  */
 public record InputFrame(
         Set<Key> heldKeys,
@@ -36,9 +40,11 @@ public record InputFrame(
         boolean focused,
         long timestampNanos,
         int[] typedChars,
-        boolean pointerTarget) {
+        boolean pointerTarget,
+        List<TouchpadContact> touchpadContacts) {
 
     public InputFrame {
+        touchpadContacts = List.copyOf(touchpadContacts);
         heldKeys = Set.copyOf(heldKeys);
         pressedKeys = Set.copyOf(pressedKeys);
         releasedKeys = Set.copyOf(releasedKeys);
@@ -92,6 +98,27 @@ public record InputFrame(
             int[] typedChars) {
         this(heldKeys, pressedKeys, releasedKeys, heldButtons, pressedButtons, releasedButtons, modifiers,
                 pointerX, pointerY, motion, scroll, focused, timestampNanos, typedChars, true);
+    }
+
+    /** Backward-compatible constructor predating touchpad contacts: the surface is reported clear. */
+    public InputFrame(
+            Set<Key> heldKeys,
+            Set<Key> pressedKeys,
+            Set<Key> releasedKeys,
+            Set<MouseButton> heldButtons,
+            Set<MouseButton> pressedButtons,
+            Set<MouseButton> releasedButtons,
+            Set<Modifier> modifiers,
+            int pointerX,
+            int pointerY,
+            PointerDelta motion,
+            ScrollDelta scroll,
+            boolean focused,
+            long timestampNanos,
+            int[] typedChars,
+            boolean pointerTarget) {
+        this(heldKeys, pressedKeys, releasedKeys, heldButtons, pressedButtons, releasedButtons, modifiers,
+                pointerX, pointerY, motion, scroll, focused, timestampNanos, typedChars, pointerTarget, List.of());
     }
 
     /** @return a copy of the code points typed this frame (empty if none), in order. */

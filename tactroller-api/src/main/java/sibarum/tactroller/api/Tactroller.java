@@ -1,5 +1,6 @@
 package sibarum.tactroller.api;
 
+import java.util.List;
 import java.util.Objects;
 import java.util.Set;
 import java.util.ServiceLoader;
@@ -188,6 +189,19 @@ public final class Tactroller implements AutoCloseable {
         return backend.drainScroll();
     }
 
+    /** @return whether the backend reads raw touchpad contacts (which does not mean a touchpad is connected). */
+    public boolean supportsTouchpad() {
+        return backend.supportsTouchpad();
+    }
+
+    /**
+     * @return the fingers on the touchpad now; empty when the surface is clear or there is no touchpad. State, not
+     *         a drain, so it can be read alongside {@link #snapshot()} or the event loop without stealing anything.
+     */
+    public List<TouchpadContact> pollTouchpad() {
+        return backend.pollTouchpad();
+    }
+
     /**
      * Capture an immutable {@link InputFrame} for this frame: held keys/buttons/modifiers, the
      * pressed/released edges since the previous snapshot, relative motion, scroll, focus and pointer
@@ -216,6 +230,7 @@ public final class Tactroller implements AutoCloseable {
         int[] chars = backend.drainChars();
         PointerState p = backend.pollPointer();
         Set<Key> keys = backend.pollKeys();
+        List<TouchpadContact> touchpad = backend.pollTouchpad();
         Set<MouseButton> buttons = p.buttons();
         int[] xy = project(p.x(), p.y(), coordinateSpace);
         long now = System.nanoTime();
@@ -238,7 +253,7 @@ public final class Tactroller implements AutoCloseable {
                 keys, pressedKeys, releasedKeys,
                 buttons, pressedBtn, releasedBtn,
                 Modifier.from(keys),
-                xy[0], xy[1], motion, scroll, focused, now, chars, pointerTarget);
+                xy[0], xy[1], motion, scroll, focused, now, chars, pointerTarget, touchpad);
 
         // How much actually happened this frame. A frame loop that is busy with nothing to do and a frame
         // loop drowning in edges look identical from the outside and are opposite problems; this is the line
@@ -461,6 +476,7 @@ public final class Tactroller implements AutoCloseable {
         int prevY = 0;
         boolean primed = false;
         boolean prevFocused = true;
+        List<TouchpadContact> prevTouchpad = List.of();
 
         while (!stopRequested && !Thread.currentThread().isInterrupted()) {
             long tickStart = System.nanoTime();
@@ -474,6 +490,7 @@ public final class Tactroller implements AutoCloseable {
                 int[] chars = backend.drainChars();
                 PointerState pointer = backend.pollPointer();
                 Set<Key> keys = backend.pollKeys();
+                List<TouchpadContact> touchpad = backend.pollTouchpad();
                 long now = System.nanoTime();
 
                 // Snapshot the coordinate space once and project once, so both the emitted position
@@ -492,6 +509,12 @@ public final class Tactroller implements AutoCloseable {
                     emitButtons(prevButtons, pointer, xy, now);
                     emitKeys(prevKeys, keys, now);
                     emitChars(chars, now);
+                }
+                // Contacts are state: emit on any change, and an emptied surface even while gated, so a listener
+                // that saw fingers land always sees them lift.
+                if (!touchpad.equals(prevTouchpad) && (!gated || touchpad.isEmpty())) {
+                    dispatch(new InputEvent.TouchpadChanged(touchpad, now));
+                    prevTouchpad = touchpad;
                 }
 
                 prevKeys = keys;

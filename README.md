@@ -145,6 +145,51 @@ For drag-and-drop with *other applications* (files in from Explorer, payloads ou
 [docs/dnd-design.md](docs/dnd-design.md) — a different channel with no polled form, planned as a standalone
 `tactroller-dnd` module rather than an `InputBackend` channel.
 
+### Touchpad: raw contacts and gestures
+
+A precision touchpad's fingers are available as raw contacts — `InputFrame.touchpadContacts()`,
+`t.pollTouchpad()`, or `InputEvent.TouchpadChanged` from the event loop — and `TouchpadGesture` turns them into
+pans, pinches (with rotation) and taps for any number of fingers from two up:
+
+```java
+TouchpadGesture gestures = new TouchpadGesture();       // 2mm threshold, 250ms taps
+
+InputFrame f = t.snapshot();                            // per frame; or feed(InputEvent) from a listener/bus
+for (GestureEvent g : gestures.feed(f)) {
+    switch (g) {
+        case GestureEvent.GestureUpdated u when u.kind() == GestureEvent.Kind.PINCH ->
+                view.zoomAbout(u.x(), u.y(), u.scale());   // scale/rotation/dx/dy are since the last update
+        case GestureEvent.GestureUpdated u when u.fingers() == 2 -> view.panBy(u.dx() * PX_PER_MM, u.dy() * PX_PER_MM);
+        case GestureEvent.GestureEnded e when e.fingers() == 3 && Math.abs(e.velocityX()) > 150 -> flipPage(e.velocityX());
+        case GestureEvent.Tapped tap when tap.fingers() == 3 -> showOverview();
+        default -> { }
+    }
+}
+```
+
+- **Millimetres, not pixels.** Contacts carry `x`/`y` in mm on the surface (and `u`/`v` normalized 0–1), so
+  thresholds and pinch distances mean the same thing on every pad. How far a view moves per mm is the
+  consumer's sensitivity. A device that does not report its physical size is assumed 100mm wide.
+- **One finger is the pointer.** Gestures need two or more; the OS already makes one finger motion and clicks.
+- **The kind is decided once** — `PAN` or `PINCH` after 2mm of travel — so a pan never zooms and a zoom never
+  drifts into a pan. A pinch is chosen when spread or twist changed by at least half as much as the centre moved.
+- **A finger-count change ends a gesture**, and after a lift nothing new starts until at most one finger is left —
+  otherwise the trailing fingers of a three-finger swipe would begin a two-finger one. `GestureEnded` carries the
+  release velocity, for kinetic scrolling and swipes.
+- **Taps** are a quick, still touch without a click; `fingers` is the most down at once.
+- **Gestures carry the pointer position**, the point a pinch should zoom about.
+
+It is **observation, not capture**: the OS keeps turning the touchpad into pointer motion, wheel scrolling (Windows
+also synthesizes Ctrl+wheel for a pinch) and its own system gestures (three/four-finger swipes, if enabled in
+Settings). A consumer that handles touchpad gestures should ignore the synthesized scroll while one is active.
+Like the drag recognizer, `TouchpadGesture` lives in `tactroller-api`, so a pinch is the same pinch on every OS.
+
+**Windows:** the RawInput hub registers the Digitizer/Touch Pad usage and decodes the HID reports through
+`hid.dll`, learning each device's layout from its preparsed data. Most laptop pads use *hybrid reporting* (one
+scan spread over several reports, only the first carrying the contact count); reports are assembled into whole
+frames before anything is published. Contacts that stop reporting for 500ms (device unplugged, sleep mid-touch)
+are dropped so a gesture cannot stay open forever. macOS and Linux report no contacts until their plumbing lands.
+
 ### Mouselook, scroll, window & focus
 
 ```java
@@ -200,6 +245,7 @@ are routed:
 |---|---|---|---|
 | Pointer position, buttons, key state | global (`GetCursorPos`, `GetAsyncKeyState` — polled) | per-window backend | positional / focal per event kind |
 | Wheel, raw relative motion, typed text | **per-process** (RawInput: last registration wins) | `WindowsRawInputHub`, fanned to every backend | positional (wheel/motion), focal (text) |
+| Touchpad contacts | **per-process** (RawInput HID) | `WindowsRawInputHub` + `WindowsTouchpadDecoder`, fanned | positional, held by the touch until the surface clears |
 | Focus (`GetForegroundWindow`) | per-window | per-window backend | always published |
 | Pointer target (`WindowFromPoint` + client rect) | global read, per-window answer | per-window backend | n/a — it *is* the positional gate |
 | Pointer lock, cursor clip/visibility | **global** (`ClipCursor`, `ShowCursor`, `SetCursorPos`) | per-window backend today; only one window may hold it | n/a |
