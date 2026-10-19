@@ -74,6 +74,10 @@ public final class WindowsInputBackend implements InputBackend {
     // The eight resize-band hit-test codes run contiguously from HTLEFT to HTBOTTOMRIGHT.
     private static final int HTLEFT = 10;
     private static final int HTBOTTOMRIGHT = 17;
+    private static final int DWMWA_CLOAKED = 14;
+    private static final int DWM_CLOAKED_APP = 0x1;
+    /** What an unattended window is told the pointer is doing: nothing, anywhere, ever. */
+    private static final PointerState STILL_POINTER = new PointerState(0, 0, Set.of());
 
     /** POINT { LONG x; LONG y; } */
     private static final MemoryLayout POINT = MemoryLayout.structLayout(
@@ -115,7 +119,19 @@ public final class WindowsInputBackend implements InputBackend {
     private MethodHandle getWindowThreadProcessId;
     private MethodHandle getCurrentThreadId;
 
+    private MethodHandle dwmGetWindowAttribute;
+
     private volatile long attachedHwnd;
+    /**
+     * Whether the attached window is one nobody at the desk can reach: one its own application cloaked
+     * ({@code DWM_CLOAKED_APP}), which is what a VexelRay background run's windows are. Such a window is driven only
+     * by whatever publishes onto its bus without a device, so this backend hands it nothing from the real devices
+     * and never touches the real cursor, and reports it focused: the one driving it is always at it, and an
+     * application that drew itself inactive would show a background run a different picture than a visible one.
+     * Read from the window when it is attached, so it needs no switch of its own and cannot disagree with it.
+     * A window another virtual desktop hides is cloaked by the shell instead, and is not this.
+     */
+    private volatile boolean unattended;
     private volatile PointerLockMode lockMode;
     /** Where the cursor was when the lock was taken, in screen pixels, so unlocking can put it back. */
     private volatile int[] preLockCursor;
@@ -153,6 +169,9 @@ public final class WindowsInputBackend implements InputBackend {
             getWindowThreadProcessId = dc(linker, user32, "GetWindowThreadProcessId",
                     FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS));
             getCurrentThreadId = dc(linker, kernel32, "GetCurrentThreadId", FunctionDescriptor.of(JAVA_INT));
+            SymbolLookup dwmapi = SymbolLookup.libraryLookup("dwmapi", arena);
+            dwmGetWindowAttribute = dc(linker, dwmapi, "DwmGetWindowAttribute",
+                    FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT, ADDRESS, JAVA_INT));
 
             pointBuffer = arena.allocate(POINT);
 
@@ -205,6 +224,9 @@ public final class WindowsInputBackend implements InputBackend {
 
     @Override
     public PointerState pollPointer() throws BackendException {
+        if (unattended) {
+            return STILL_POINTER;
+        }
         try {
             int ok = (int) getCursorPos.invokeExact(pointBuffer);
             if (ok == 0) {
@@ -251,6 +273,9 @@ public final class WindowsInputBackend implements InputBackend {
     }
 
     private boolean down(int vk) throws Throwable {
+        if (unattended) {
+            return false;
+        }
         short state = (short) getAsyncKeyState.invokeExact(vk);
         return (state & DOWN_MASK) != 0;
     }
@@ -261,7 +286,7 @@ public final class WindowsInputBackend implements InputBackend {
     public ScrollDelta drainScroll() {
         int y = scrollUnitsY.getAndSet(0);
         int x = scrollUnitsX.getAndSet(0);
-        if (x == 0 && y == 0) {
+        if (unattended || x == 0 && y == 0) {
             return ScrollDelta.ZERO;
         }
         return new ScrollDelta((double) x / WHEEL_DELTA, (double) y / WHEEL_DELTA);
@@ -277,6 +302,9 @@ public final class WindowsInputBackend implements InputBackend {
             s = charBuf.toString();
             charBuf.setLength(0);
         }
+        if (unattended) {
+            return NO_CHARS;
+        }
         return s.codePoints().toArray(); // fold any UTF-16 surrogate pairs into single code points
     }
 
@@ -288,6 +316,9 @@ public final class WindowsInputBackend implements InputBackend {
     @Override
     public List<TouchpadContact> pollTouchpad() {
         List<TouchpadContact> contacts = touchpad;
+        if (unattended) {
+            return List.of();
+        }
         // A precision touchpad reports continuously while any finger is down, so contacts that have gone quiet were
         // never lifted as far as we heard -- the device was unplugged, or the machine slept mid-touch. Left alone
         // they would hold a gesture open forever.
@@ -300,6 +331,11 @@ public final class WindowsInputBackend implements InputBackend {
     @Override
     public PointerDelta drainPointerDelta() {
         PointerLockMode mode = lockMode;
+        if (unattended) {
+            rawDx.set(0);
+            rawDy.set(0);
+            return PointerDelta.ZERO;
+        }
         if (mode == PointerLockMode.RAW) {
             int dx = rawDx.getAndSet(0);
             int dy = rawDy.getAndSet(0);
@@ -332,6 +368,10 @@ public final class WindowsInputBackend implements InputBackend {
 
     @Override
     public void setPointerLock(PointerLockMode mode) throws BackendException {
+        if (unattended) {
+            lockMode = mode;   // held, so the application sees its lock; the real cursor is the desk's, not ours
+            return;
+        }
         try {
             boolean wasLocked = lockMode != null;
             lockMode = mode;
@@ -359,6 +399,9 @@ public final class WindowsInputBackend implements InputBackend {
             return;
         }
         lockMode = null;
+        if (unattended) {
+            return;
+        }
         try {
             int[] back = preLockCursor;
             preLockCursor = null;
@@ -385,11 +428,24 @@ public final class WindowsInputBackend implements InputBackend {
             throw new BackendException("Windows backend requires an HWND, got " + window.kind());
         }
         attachedHwnd = window.handle();
+        unattended = cloakedByItsApplication(window.handle());
     }
 
     @Override
     public void detach() {
         attachedHwnd = 0L;
+        unattended = false;
+    }
+
+    /** {@code DWMWA_CLOAKED} has {@code DWM_CLOAKED_APP}: see {@link #unattended}. */
+    private boolean cloakedByItsApplication(long hwnd) throws BackendException {
+        try (Arena a = Arena.ofConfined()) {
+            MemorySegment out = a.allocate(JAVA_INT);
+            int hr = (int) dwmGetWindowAttribute.invokeExact(MemorySegment.ofAddress(hwnd), DWMWA_CLOAKED, out, 4);
+            return hr == 0 && (out.get(JAVA_INT, 0) & DWM_CLOAKED_APP) != 0;
+        } catch (Throwable t) {
+            throw wrap("DwmGetWindowAttribute(DWMWA_CLOAKED) failed", t);
+        }
     }
 
     @Override
@@ -401,7 +457,7 @@ public final class WindowsInputBackend implements InputBackend {
     @SuppressWarnings("restricted")
     public boolean isFocused() {
         long hwnd = attachedHwnd;
-        if (hwnd == 0L) {
+        if (hwnd == 0L || unattended) {
             return true;
         }
         try {
@@ -444,6 +500,9 @@ public final class WindowsInputBackend implements InputBackend {
         long hwnd = attachedHwnd;
         if (hwnd == 0L) {
             return true;
+        }
+        if (unattended) {
+            return false;
         }
         try (Arena a = Arena.ofConfined()) {
             MemorySegment pt = a.allocate(POINT);
@@ -552,6 +611,9 @@ public final class WindowsInputBackend implements InputBackend {
 
     @Override
     public void warpPointer(int screenX, int screenY) throws BackendException {
+        if (unattended) {
+            return;
+        }
         try {
             if ((int) setCursorPos.invokeExact(screenX, screenY) == 0) {
                 throw new BackendException("SetCursorPos(" + screenX + ", " + screenY + ") was refused");
