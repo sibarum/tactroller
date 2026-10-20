@@ -6,7 +6,7 @@
 
     <groupId>sibarum.tactroller</groupId>
     <artifactId>tactroller</artifactId>
-    <version>1.1-SNAPSHOT</version>
+    <version>1.1</version>
     <packaging>pom</packaging>
 
     <name>Tactroller</name>
@@ -67,7 +67,7 @@
             <dependency>
                 <groupId>sibarum.atchung</groupId>
                 <artifactId>atchung-core</artifactId>
-                <version>1.1-SNAPSHOT</version>
+                <version>1.1</version>
             </dependency>
         </dependencies>
     </dependencyManagement>
@@ -112,7 +112,7 @@
             <plugin>
                 <groupId>dev.vexelray.build</groupId>
                 <artifactId>vexelray-build-maven-plugin</artifactId>
-                <version>0.1.1-SNAPSHOT</version>
+                <version>0.1.1</version>
                 <executions>
                     <execution>
                         <goals>
