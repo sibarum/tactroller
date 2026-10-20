@@ -423,6 +423,11 @@ public final class WindowsInputBackend implements InputBackend {
     // ---- Window attachment / focus / coordinates -------------------------
 
     @Override
+    public NativeWindow window(long osHandle) {
+        return NativeWindow.ofHwnd(osHandle);
+    }
+
+    @Override
     public void attach(NativeWindow window) throws BackendException {
         if (window.kind() != NativeWindow.Kind.HWND) {
             throw new BackendException("Windows backend requires an HWND, got " + window.kind());

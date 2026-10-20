@@ -287,6 +287,14 @@ public final class Tactroller implements AutoCloseable {
         backend.attach(Objects.requireNonNull(window, "window"));
     }
 
+    /**
+     * Attach a host window by its raw OS handle ({@code HWND}, X11 {@code Window}, ...); the backend decides what
+     * kind of handle that is on its platform.
+     */
+    public void attach(long osHandle) throws BackendException {
+        backend.attach(backend.window(osHandle));
+    }
+
     /** Detach the current window; coordinate space falls back to screen. */
     public void detach() {
         backend.detach();

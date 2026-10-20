@@ -99,6 +99,17 @@ public interface InputBackend extends AutoCloseable {
         throw new UnsupportedOperationException(name() + " does not support window attachment yet");
     }
 
+    /**
+     * The {@link NativeWindow} a raw OS window handle is on this backend's platform: an {@code HWND} on Windows, an
+     * X11 {@code Window} on Linux. What lets a host that holds only a handle attach it without knowing which OS it
+     * is on, which is the backend's knowledge, not the host's.
+     *
+     * @throws UnsupportedOperationException if this backend has no window integration
+     */
+    default NativeWindow window(long osHandle) {
+        throw new UnsupportedOperationException(name() + " does not support window attachment yet");
+    }
+
     /** Release a previously attached window. No-op if none attached. */
     default void detach() {
         // no-op by default

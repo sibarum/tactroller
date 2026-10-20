@@ -4,7 +4,9 @@ import sibarum.tactroller.api.BackendException;
 import sibarum.tactroller.api.InputBackend;
 import sibarum.tactroller.api.Key;
 import sibarum.tactroller.api.MouseButton;
+import sibarum.tactroller.api.NativeWindow;
 import sibarum.tactroller.api.PointerState;
+import sibarum.tactroller.api.ScrollDelta;
 
 import java.lang.foreign.Arena;
 import java.lang.foreign.FunctionDescriptor;
@@ -31,6 +33,10 @@ import java.util.Set;
  * libX11 is the standard X11 client library; it is bound by soname and not bundled. This backend
  * targets X11 (or XWayland). A native Wayland path would use libinput/evdev instead and can be
  * added as a sibling backend later.
+ *
+ * <p>Pointer and key <em>state</em> are polled here, on the loop thread. Everything that only exists as an
+ * event — typed characters, the wheel, focus, whether the pointer is over the window — comes from
+ * {@link X11WindowEvents}, which runs while a window is {@linkplain #attach attached}.
  */
 public final class LinuxInputBackend implements InputBackend {
 
@@ -46,6 +52,12 @@ public final class LinuxInputBackend implements InputBackend {
     private MethodHandle xQueryPointer;
     private MethodHandle xQueryKeymap;
     private MethodHandle xKeysymToKeycode;
+    private MethodHandle xTranslateCoordinates;
+    private MethodHandle xWarpPointer;
+    private MethodHandle xFlush;
+
+    private long attachedWindow;
+    private X11WindowEvents windowEvents;
 
     private MemorySegment display;
     private long rootWindow;
@@ -103,6 +115,26 @@ public final class LinuxInputBackend implements InputBackend {
             xKeysymToKeycode = linker.downcallHandle(
                     x11.findOrThrow("XKeysymToKeycode"),
                     FunctionDescriptor.of(ValueLayout.JAVA_BYTE, ValueLayout.ADDRESS, ValueLayout.JAVA_LONG));
+            xTranslateCoordinates = linker.downcallHandle(
+                    x11.findOrThrow("XTranslateCoordinates"),
+                    FunctionDescriptor.of(ValueLayout.JAVA_INT,
+                            ValueLayout.ADDRESS,   // display
+                            ValueLayout.JAVA_LONG, // src_w
+                            ValueLayout.JAVA_LONG, // dest_w
+                            ValueLayout.JAVA_INT,  // src_x
+                            ValueLayout.JAVA_INT,  // src_y
+                            ValueLayout.ADDRESS,   // dest_x_return
+                            ValueLayout.ADDRESS,   // dest_y_return
+                            ValueLayout.ADDRESS)); // child_return
+            xWarpPointer = linker.downcallHandle(
+                    x11.findOrThrow("XWarpPointer"),
+                    FunctionDescriptor.of(ValueLayout.JAVA_INT,
+                            ValueLayout.ADDRESS, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG,
+                            ValueLayout.JAVA_INT, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT,
+                            ValueLayout.JAVA_INT, ValueLayout.JAVA_INT));
+            xFlush = linker.downcallHandle(
+                    x11.findOrThrow("XFlush"),
+                    FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
 
             display = (MemorySegment) xOpenDisplay.invokeExact(MemorySegment.NULL);
             if (display.equals(MemorySegment.NULL)) {
@@ -121,7 +153,7 @@ public final class LinuxInputBackend implements InputBackend {
 
             // Resolve keysyms to keycodes once against the live server keymap.
             for (Map.Entry<Key, Long> e : keysymByKey.entrySet()) {
-                byte kc = (byte) xKeysymToKeycode.invokeExact(display, e.getValue());
+                byte kc = (byte) xKeysymToKeycode.invokeExact(display, (long) e.getValue());
                 keycodeByKey.put(e.getKey(), kc & 0xFF);
             }
         } catch (BackendException e) {
@@ -201,8 +233,107 @@ public final class LinuxInputBackend implements InputBackend {
         }
     }
 
+    // ---- The attached window -----------------------------------------------------------------------------------
+
+    /**
+     * Attach an X11 window: from now on focus, pointer-over, typed characters and the wheel are read for it.
+     * Re-attaching replaces the previous window.
+     */
+    @Override
+    public void attach(NativeWindow window) throws BackendException {
+        if (window.kind() != NativeWindow.Kind.X11_WINDOW) {
+            throw new BackendException(name() + " attaches X11 windows, not " + window.kind());
+        }
+        detach();
+        windowEvents = new X11WindowEvents(window.handle());
+        attachedWindow = window.handle();
+    }
+
+    @Override
+    public NativeWindow window(long osHandle) {
+        return NativeWindow.ofX11Window(osHandle);
+    }
+
+    @Override
+    public void detach() {
+        if (windowEvents != null) {
+            windowEvents.close();
+            windowEvents = null;
+        }
+        attachedWindow = 0L;
+    }
+
+    @Override
+    public boolean isWindowAttached() {
+        return windowEvents != null;
+    }
+
+    @Override
+    public boolean isFocused() {
+        X11WindowEvents events = windowEvents;
+        return events == null || events.focused();
+    }
+
+    @Override
+    public boolean isPointerTarget() {
+        X11WindowEvents events = windowEvents;
+        return events == null || events.pointerInside();
+    }
+
+    @Override
+    public int[] toClient(int screenX, int screenY) {
+        return attachedWindow == 0L ? new int[]{screenX, screenY} : translate(rootWindow, attachedWindow, screenX, screenY);
+    }
+
+    @Override
+    public int[] toScreen(int clientX, int clientY) {
+        return attachedWindow == 0L ? new int[]{clientX, clientY} : translate(attachedWindow, rootWindow, clientX, clientY);
+    }
+
+    private int[] translate(long from, long to, int x, int y) {
+        try (Arena temp = Arena.ofConfined()) {
+            MemorySegment dx = temp.allocate(ValueLayout.JAVA_INT);
+            MemorySegment dy = temp.allocate(ValueLayout.JAVA_INT);
+            MemorySegment child = temp.allocate(ValueLayout.JAVA_LONG);
+            int ok = (int) xTranslateCoordinates.invokeExact(display, from, to, x, y, dx, dy, child);
+            return ok == 0 ? new int[]{x, y} : new int[]{dx.get(ValueLayout.JAVA_INT, 0), dy.get(ValueLayout.JAVA_INT, 0)};
+        } catch (Throwable t) {
+            return new int[]{x, y};
+        }
+    }
+
+    @Override
+    public boolean supportsPointerWarp() {
+        return true;
+    }
+
+    /** {@code XWarpPointer} to a root-window point. XWayland honours it only while the pointer is over this client. */
+    @Override
+    public void warpPointer(int screenX, int screenY) throws BackendException {
+        try {
+            int ignored = (int) xWarpPointer.invokeExact(display, 0L, rootWindow, 0, 0, 0, 0, screenX, screenY);
+            int ignored2 = (int) xFlush.invokeExact(display);
+        } catch (Throwable t) {
+            throw new BackendException("XWarpPointer failed", t);
+        }
+    }
+
+    @Override
+    public ScrollDelta drainScroll() {
+        X11WindowEvents events = windowEvents;
+        return events == null ? ScrollDelta.ZERO : events.drainScroll();
+    }
+
+    @Override
+    public int[] drainChars() {
+        X11WindowEvents events = windowEvents;
+        int[] chars = events == null ? null : events.drainChars();
+        return chars == null ? NO_CHARS : chars;
+    }
+
     @Override
     public void close() {
+        detach();
         try {
             if (display != null && !display.equals(MemorySegment.NULL) && xCloseDisplay != null) {
                 int ignored = (int) xCloseDisplay.invokeExact(display);
@@ -246,6 +377,35 @@ public final class LinuxInputBackend implements InputBackend {
         m.put(Key.RIGHT_ALT, 0xFFEAL);
         m.put(Key.LEFT_SUPER, 0xFFEBL);
         m.put(Key.RIGHT_SUPER, 0xFFECL);
+        for (int f = 1; f <= 12; f++) {
+            m.put(Key.valueOf("F" + f), 0xFFBEL + (f - 1));
+        }
+        m.put(Key.INSERT, 0xFF63L);
+        m.put(Key.HOME, 0xFF50L);
+        m.put(Key.END, 0xFF57L);
+        m.put(Key.PAGE_UP, 0xFF55L);
+        m.put(Key.PAGE_DOWN, 0xFF56L);
+        m.put(Key.CAPS_LOCK, 0xFFE5L);
+        for (int n = 0; n <= 9; n++) {
+            m.put(Key.valueOf("NUMPAD_" + n), 0xFFB0L + n);
+        }
+        m.put(Key.NUMPAD_ADD, 0xFFABL);
+        m.put(Key.NUMPAD_SUBTRACT, 0xFFADL);
+        m.put(Key.NUMPAD_MULTIPLY, 0xFFAAL);
+        m.put(Key.NUMPAD_DIVIDE, 0xFFAFL);
+        m.put(Key.NUMPAD_DECIMAL, 0xFFAEL);
+        m.put(Key.NUMPAD_ENTER, 0xFF8DL);
+        m.put(Key.MINUS, (long) '-');
+        m.put(Key.EQUAL, (long) '=');
+        m.put(Key.LEFT_BRACKET, (long) '[');
+        m.put(Key.RIGHT_BRACKET, (long) ']');
+        m.put(Key.BACKSLASH, (long) '\\');
+        m.put(Key.SEMICOLON, (long) ';');
+        m.put(Key.APOSTROPHE, (long) '\'');
+        m.put(Key.COMMA, (long) ',');
+        m.put(Key.PERIOD, (long) '.');
+        m.put(Key.SLASH, (long) '/');
+        m.put(Key.GRAVE_ACCENT, (long) '`');
         return m;
     }
 }
