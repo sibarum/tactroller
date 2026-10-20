@@ -21,6 +21,7 @@
     -->
     <modules>
         <module>tactroller-api</module>
+        <module>tactroller-clipboard-api</module>
         <module>tactroller-clipboard</module>
         <module>tactroller-atchung</module>
     </modules>
@@ -62,6 +63,21 @@
             <dependency>
                 <groupId>sibarum.tactroller</groupId>
                 <artifactId>tactroller-clipboard</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>sibarum.tactroller</groupId>
+                <artifactId>tactroller-clipboard-api</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>sibarum.tactroller</groupId>
+                <artifactId>tactroller-clipboard-windows</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>sibarum.tactroller</groupId>
+                <artifactId>tactroller-clipboard-linux</artifactId>
                 <version>${project.version}</version>
             </dependency>
             <dependency>
@@ -152,6 +168,7 @@
             </activation>
             <modules>
                 <module>tactroller-windows</module>
+                <module>tactroller-clipboard-windows</module>
             </modules>
         </profile>
 
@@ -175,6 +192,7 @@
             </activation>
             <modules>
                 <module>tactroller-linux</module>
+                <module>tactroller-clipboard-linux</module>
             </modules>
         </profile>
     </profiles>

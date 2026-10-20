@@ -14,7 +14,40 @@
 
     <name>Tactroller Clipboard</name>
     <description>Standalone system-clipboard access (text get/set) via Panama. Independent of the input
-        subsystem — depends on nothing. The host OS backend is selected at runtime; Windows is
-        implemented, other platforms follow.</description>
+        subsystem. Holds no platform knowledge: the backend is the tactroller-clipboard-&lt;os&gt; module the
+        profiles below add, found through ServiceLoader.</description>
 
+    <dependencies>
+        <dependency>
+            <groupId>sibarum.tactroller</groupId>
+            <artifactId>tactroller-clipboard-api</artifactId>
+        </dependency>
+    </dependencies>
+
+    <!-- Exactly one OS module, picked by the build host's OS, so every application on this facade gets its
+         platform's clipboard without naming it. -->
+    <profiles>
+        <profile>
+            <id>platform-windows</id>
+            <activation><os><family>windows</family></os></activation>
+            <dependencies>
+                <dependency>
+                    <groupId>sibarum.tactroller</groupId>
+                    <artifactId>tactroller-clipboard-windows</artifactId>
+                    <scope>runtime</scope>
+                </dependency>
+            </dependencies>
+        </profile>
+        <profile>
+            <id>platform-linux</id>
+            <activation><os><family>unix</family><name>linux</name></os></activation>
+            <dependencies>
+                <dependency>
+                    <groupId>sibarum.tactroller</groupId>
+                    <artifactId>tactroller-clipboard-linux</artifactId>
+                    <scope>runtime</scope>
+                </dependency>
+            </dependencies>
+        </profile>
+    </profiles>
 </project>

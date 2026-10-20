@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>sibarum.tactroller</groupId>
+        <artifactId>tactroller</artifactId>
+        <version>1.2-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>tactroller-clipboard-linux</artifactId>
+
+    <name>Tactroller Clipboard :: linux</name>
+    <description>The Linux clipboard: the X11 CLIPBOARD selection through libX11 and Panama (XWayland under a Wayland
+        session). A ClipboardBackend found through ServiceLoader; tactroller-clipboard's OS-activated profile adds it.</description>
+
+    <dependencies>
+        <dependency>
+            <groupId>sibarum.tactroller</groupId>
+            <artifactId>tactroller-clipboard-api</artifactId>
+        </dependency>
+    </dependencies>
+</project>

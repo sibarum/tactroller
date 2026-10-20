@@ -1,10 +1,6 @@
 package sibarum.tactroller.clipboard;
 
-import sibarum.tactroller.clipboard.linux.LinuxClipboardBackend;
-import sibarum.tactroller.clipboard.macos.MacosClipboardBackend;
-import sibarum.tactroller.clipboard.windows.WindowsClipboardBackend;
 
-import java.util.Locale;
 import java.util.Objects;
 import java.util.Optional;
 
@@ -19,8 +15,10 @@ import java.util.Optional;
  * }
  * }</pre>
  *
- * <p>The platform backend is selected at runtime from {@code os.name}. Windows is implemented;
- * other platforms throw {@link ClipboardException} from {@link #open()} until their bindings land.
+ * <p>The platform backend is the one {@link ClipboardBackend} on the class path, found through
+ * {@link java.util.ServiceLoader}: {@code tactroller-clipboard-windows} or {@code tactroller-clipboard-linux}, which
+ * this module's OS-activated build profile adds. This module holds no platform knowledge of its own. Where there is
+ * no OS module (macOS, today), {@link #open()} throws {@link ClipboardException}.
  */
 public final class Clipboard implements AutoCloseable {
 
@@ -38,17 +36,15 @@ public final class Clipboard implements AutoCloseable {
     }
 
     private static ClipboardBackend resolveBackend() throws ClipboardException {
-        String os = System.getProperty("os.name", "").toLowerCase(Locale.ROOT);
-        if (os.contains("win")) {
-            return new WindowsClipboardBackend();
+        java.util.List<ClipboardBackend> found = java.util.ServiceLoader.load(ClipboardBackend.class).stream()
+                .map(java.util.ServiceLoader.Provider::get)
+                .toList();
+        if (found.size() != 1) {
+            throw new ClipboardException((found.isEmpty() ? "no" : found.size() + "")
+                    + " clipboard OS modules on the class path; exactly one of tactroller-clipboard-windows or "
+                    + "tactroller-clipboard-linux is needed, which tactroller-clipboard's OS-activated profile adds");
         }
-        if (os.contains("mac") || os.contains("darwin")) {
-            return new MacosClipboardBackend();
-        }
-        if (os.contains("nux") || os.contains("nix") || os.contains("aix")) {
-            return new LinuxClipboardBackend();
-        }
-        throw new ClipboardException("No clipboard backend for OS: " + os);
+        return found.getFirst();
     }
 
     /** @return the identifier of the resolved backend. */
