@@ -243,6 +243,8 @@ final class X11WindowEvents implements AutoCloseable {
 
     /** {@code (deviceid << 16) | valuator number} to its axis; pump thread only. */
     private final Map<Long, ScrollAxis> axes = new HashMap<>();
+    /** Keysyms to characters, dead keys included; pump thread only. */
+    private final Xkb xkb = Xkb.open();
 
     private final Object lock = new Object();
     private final StringBuilder chars = new StringBuilder();
@@ -417,13 +419,14 @@ final class X11WindowEvents implements AutoCloseable {
             focused = true;
         } else if (evtype == XI_FocusOut) {
             focused = false;
+            xkb.reset();   // a dead key pressed here does not carry into another window
         } else if (evtype == XI_DeviceChanged) {
             loadAxes();
         }
     }
 
     /**
-     * A key press as text. Repeats are dropped: typed characters never repeat, only command keys do, and those are
+     * A key press as text, through the layout's keysym and then compose ({@link Xkb}). Repeats are dropped: typed characters never repeat, only command keys do, and those are
      * read from the key state rather than from here. Control characters ride the key channel, as on every backend.
      */
     private void onKey(MemorySegment e) throws Throwable {
@@ -443,10 +446,12 @@ final class X11WindowEvents implements AutoCloseable {
             MemorySegment buf = temp.allocate(32);
             MemorySegment keysym = temp.allocate(JAVA_LONG);
             int ignored = (int) XLookupString.invokeExact(key, buf, 32, keysym, MemorySegment.NULL);
-            int cp = Keysyms.toCodePoint(keysym.get(JAVA_LONG, 0));
-            if (cp >= 0x20 && cp != 0x7F) {
+            int[] typed = xkb.press(keysym.get(JAVA_LONG, 0));
+            if (typed.length > 0) {
                 synchronized (lock) {
-                    chars.appendCodePoint(cp);
+                    for (int cp : typed) {
+                        chars.appendCodePoint(cp);
+                    }
                 }
             }
         }
@@ -535,6 +540,7 @@ final class X11WindowEvents implements AutoCloseable {
             int a = (int) close.invokeExact(stopPipe[0]);
             int b = (int) close.invokeExact(stopPipe[1]);
             int c = (int) XCloseDisplay.invokeExact(display);
+            xkb.close();
         } catch (Throwable ignored) {
             // best effort
         } finally {
