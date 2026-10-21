@@ -4,6 +4,8 @@ Cross-platform input-device middleware API for the JVM, built on the **Panama** 
 Memory API (JEP 454) with **platform-specific native bindings**, and designed to compile cleanly
 under **GraalVM native-image**.
 
+Part of the [VexelRay](https://sibarum.github.io/) stack. Building an application on it? Start at the [developer guide](https://sibarum.github.io/vexelray-framework/developers/).
+
 Tactroller exposes one OS-agnostic API for polling pointer position, mouse buttons and key state.
 Each supported OS is a separate Maven module that binds that platform's native input libraries
 directly — no third-party runtime dependencies.
