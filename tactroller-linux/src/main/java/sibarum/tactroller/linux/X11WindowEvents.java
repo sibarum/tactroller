@@ -36,7 +36,7 @@ import static java.lang.foreign.ValueLayout.JAVA_SHORT;
  *
  * <p><b>Occlusion comes free.</b> {@code XI_Enter}/{@code XI_Leave} are sent by the server against the real stacking
  * order, so "the pointer is over this window and nothing covers it there" is exactly whether the last crossing was an
- * enter.
+ * enter, once the state the crossings start from has been asked for ({@link #readInitialState}).
  */
 final class X11WindowEvents implements AutoCloseable {
 
@@ -201,6 +201,9 @@ final class X11WindowEvents implements AutoCloseable {
             FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, ADDRESS, ADDRESS));
     private static final MethodHandle XGetInputFocus = bind(X11, "XGetInputFocus",
             FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS));
+    private static final MethodHandle XQueryPointer = bind(X11, "XQueryPointer",
+            FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_LONG, ADDRESS, ADDRESS, ADDRESS, ADDRESS, ADDRESS, ADDRESS,
+                    ADDRESS));
     private static final MethodHandle XIQueryVersion = bind(XI, "XIQueryVersion",
             FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS));
     private static final MethodHandle XISelectEvents = bind(XI, "XISelectEvents",
@@ -309,8 +312,10 @@ final class X11WindowEvents implements AutoCloseable {
     }
 
     /**
-     * Whether the window has the keyboard right now, before any focus event says so. The pointer starts outside:
-     * a window mapped under the pointer is sent an enter by the server, so there is nothing to guess.
+     * Whether the window has the keyboard, and whether the pointer is over it, right now, before any event says so.
+     * Asked after {@link #select}, so whatever changes after the answer arrives as an event. Both have to be asked:
+     * the window is mapped, focused and entered well before it is attached (a native image gets there in tens of
+     * milliseconds), so the enter the server sends a window mapped under the pointer has come and gone.
      */
     private void readInitialState() throws Throwable {
         try (Arena temp = Arena.ofConfined()) {
@@ -318,7 +323,31 @@ final class X11WindowEvents implements AutoCloseable {
             MemorySegment revert = temp.allocate(JAVA_INT);
             int ignored = (int) XGetInputFocus.invokeExact(display, focus, revert);
             focused = focus.get(JAVA_LONG, 0) == window;
+            pointerInside = pointerOver(temp);
         }
+    }
+
+    /**
+     * Whether the pointer is over this window with nothing covering it there: from the root down, the child the
+     * pointer is in at each level, which the server picks in stacking order, as it does for crossings.
+     */
+    private boolean pointerOver(Arena temp) throws Throwable {
+        MemorySegment root = temp.allocate(JAVA_LONG);
+        MemorySegment child = temp.allocate(JAVA_LONG);
+        MemorySegment ints = temp.allocate(JAVA_INT, 5);
+        int onScreen = (int) XQueryPointer.invokeExact(display, window, root, child, ints,
+                ints.asSlice(4), ints.asSlice(8), ints.asSlice(12), ints.asSlice(16));
+        long at = root.get(JAVA_LONG, 0);
+        // Deep enough for a window manager's frame and its decorations; a real tree is three or four levels.
+        for (int depth = 0; onScreen != 0 && at != 0 && depth < 16; depth++) {
+            if (at == window) {
+                return true;
+            }
+            onScreen = (int) XQueryPointer.invokeExact(display, at, root, child, ints,
+                    ints.asSlice(4), ints.asSlice(8), ints.asSlice(12), ints.asSlice(16));
+            at = child.get(JAVA_LONG, 0);
+        }
+        return false;
     }
 
     /** Every master device's scroll valuators, with where each one stands now. Pump thread (or constructor). */
