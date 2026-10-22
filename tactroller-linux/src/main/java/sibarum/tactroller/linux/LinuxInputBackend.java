@@ -37,6 +37,12 @@ import java.util.Set;
  * <p>Pointer and key <em>state</em> are polled here, on the loop thread. Everything that only exists as an
  * event — typed characters, the wheel, focus, whether the pointer is over the window — comes from
  * {@link X11WindowEvents}, which runs while a window is {@linkplain #attach attached}.
+ *
+ * <p><b>No press is lost between polls.</b> The loop derives presses and releases from consecutive polls, so a click
+ * quicker than a frame would vanish. While a window is attached, each poll also takes the presses and releases seen
+ * since the last one ({@link #settle}): a button reported up stays up only if it was never pressed meanwhile, and one
+ * reported down stays down only if it was never released. A whole click between two polls is then down in one and up
+ * in the next, one frame late rather than never.
  */
 public final class LinuxInputBackend implements InputBackend {
 
@@ -74,6 +80,12 @@ public final class LinuxInputBackend implements InputBackend {
 
     private final Map<Key, Long> keysymByKey = buildKeysymMap();
     private final Map<Key, Integer> keycodeByKey = new EnumMap<>(Key.class);
+
+    // What the last poll reported, and the edges drained into it (loop/poll thread only).
+    private int reportedButtons;
+    private final Set<Key> reportedKeys = EnumSet.noneOf(Key.class);
+    private final byte[] keysPressed = new byte[32];
+    private final byte[] keysReleased = new byte[32];
 
     @Override
     public String name() {
@@ -174,6 +186,19 @@ public final class LinuxInputBackend implements InputBackend {
             int x = rootX.get(ValueLayout.JAVA_INT, 0);
             int y = rootY.get(ValueLayout.JAVA_INT, 0);
             int mask = maskReturn.get(ValueLayout.JAVA_INT, 0);
+            X11WindowEvents events = windowEvents;
+            if (events != null) {
+                long edges = events.drainButtonEdges();
+                int settled = 0;
+                for (int bit : new int[]{BUTTON1_MASK, BUTTON2_MASK, BUTTON3_MASK}) {
+                    if (settle((reportedButtons & bit) != 0, (mask & bit) != 0,
+                            ((int) edges & bit) != 0, ((int) (edges >>> 32) & bit) != 0)) {
+                        settled |= bit;
+                    }
+                }
+                mask = settled;
+            }
+            reportedButtons = mask;
 
             Set<MouseButton> buttons = EnumSet.noneOf(MouseButton.class);
             if ((mask & BUTTON1_MASK) != 0) buttons.add(MouseButton.LEFT);
@@ -183,6 +208,32 @@ public final class LinuxInputBackend implements InputBackend {
             return new PointerState(x, y, buttons);
         } catch (Throwable t) {
             throw new BackendException("Native pointer poll failed", t);
+        }
+    }
+
+    /**
+     * What a poll reports for one button or key: its live state, unless an edge since the last poll says the last
+     * report is stale. Down last time and released since: up, even if pressed again (the next poll sees that). Up
+     * last time and pressed since: down, even if released again (the next poll sees that).
+     */
+    private static boolean settle(boolean wasDown, boolean live, boolean pressedSince, boolean releasedSince) {
+        return wasDown ? live && !releasedSince : live || pressedSince;
+    }
+
+    /** The live state of one button, without taking the edges a poll would. */
+    @Override
+    public boolean isButtonDown(MouseButton button) throws BackendException {
+        try {
+            int ignored = (int) xQueryPointer.invokeExact(
+                    display, rootWindow, rootReturn, childReturn, rootX, rootY, winX, winY, maskReturn);
+            int mask = maskReturn.get(ValueLayout.JAVA_INT, 0);
+            return (mask & switch (button) {
+                case LEFT -> BUTTON1_MASK;
+                case MIDDLE -> BUTTON2_MASK;
+                case RIGHT -> BUTTON3_MASK;
+            }) != 0;
+        } catch (Throwable t) {
+            throw new BackendException("Native button poll failed for " + button, t);
         }
     }
 
@@ -214,17 +265,27 @@ public final class LinuxInputBackend implements InputBackend {
             if (ok == 0) {
                 throw new BackendException("XQueryKeymap failed");
             }
+            X11WindowEvents events = windowEvents;
+            if (events != null) {
+                events.drainKeyEdges(keysPressed, keysReleased);
+            }
             EnumSet<Key> down = EnumSet.noneOf(Key.class);
             for (Map.Entry<Key, Integer> e : keycodeByKey.entrySet()) {
                 int kc = e.getValue();
                 if (kc == 0) {
                     continue;
                 }
-                int b = keymap.get(ValueLayout.JAVA_BYTE, kc / 8) & 0xFF;
-                if ((b & (1 << (kc % 8))) != 0) {
+                int bit = 1 << (kc % 8);
+                boolean live = (keymap.get(ValueLayout.JAVA_BYTE, kc / 8) & bit) != 0;
+                boolean isDown = events == null ? live
+                        : settle(reportedKeys.contains(e.getKey()), live,
+                                (keysPressed[kc / 8] & bit) != 0, (keysReleased[kc / 8] & bit) != 0);
+                if (isDown) {
                     down.add(e.getKey());
                 }
             }
+            reportedKeys.clear();
+            reportedKeys.addAll(down);
             return down;
         } catch (BackendException e) {
             throw e;

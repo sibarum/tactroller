@@ -12,6 +12,7 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.SymbolLookup;
 import java.lang.foreign.ValueLayout;
 import java.lang.invoke.MethodHandle;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
 
@@ -34,6 +35,12 @@ import static java.lang.foreign.ValueLayout.JAVA_SHORT;
  * from the pointer's <em>scroll valuators</em> on {@code XI_Motion} instead (XI 2.1 smooth scrolling), which every
  * current server, XWayland included, provides and which involves no grab.
  *
+ * <p><b>Presses between polls.</b> Buttons and keys are polled as state, once a frame, and a press and release that
+ * both fall between two polls leave the state unchanged: at a low enough frame rate (a frame longer than a click)
+ * every click is lost. So the presses and releases themselves are also read, as XI2 <em>raw</em> events selected on
+ * the root window, which take no grab and so leave the owner's alone, and are latched here until the backend's next
+ * poll drains them ({@link #drainButtonEdges}, {@link #drainKeyEdges}).
+ *
  * <p><b>Occlusion comes free.</b> {@code XI_Enter}/{@code XI_Leave} are sent by the server against the real stacking
  * order, so "the pointer is over this window and nothing covers it there" is exactly whether the last crossing was an
  * enter, once the state the crossings start from has been asked for ({@link #readInitialState}).
@@ -48,6 +55,10 @@ final class X11WindowEvents implements AutoCloseable {
     private static final int XI_Leave = 8;
     private static final int XI_FocusIn = 9;
     private static final int XI_FocusOut = 10;
+    private static final int XI_RawKeyPress = 13;
+    private static final int XI_RawKeyRelease = 14;
+    private static final int XI_RawButtonPress = 15;
+    private static final int XI_RawButtonRelease = 16;
 
     private static final int XIAllDevices = 0;
     private static final int XIAllMasterDevices = 1;
@@ -58,7 +69,17 @@ final class X11WindowEvents implements AutoCloseable {
 
     private static final int GenericEvent = 35;
     private static final int KeyPress = 2;
+    private static final int MappingNotify = 34;
+    private static final int MappingPointer = 2;
     private static final long XEVENT_SIZE = 24 * 8;
+
+    /** {@code XMappingEvent.request}: after type, serial, send_event, display and window. */
+    private static final long MAPPING_REQUEST_OFFSET = 40;
+
+    /** The core button-mask bit (X.h {@code Button1Mask} on) for logical buttons 1 to 3; 0 for the rest. */
+    private static int buttonMask(int logical) {
+        return logical >= 1 && logical <= 3 ? 1 << (7 + logical) : 0;
+    }
 
     // ---- Struct layouts ---------------------------------------------------------------------------------------------
 
@@ -201,6 +222,10 @@ final class X11WindowEvents implements AutoCloseable {
             FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, ADDRESS, ADDRESS));
     private static final MethodHandle XGetInputFocus = bind(X11, "XGetInputFocus",
             FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS));
+    private static final MethodHandle XDefaultRootWindow = bind(X11, "XDefaultRootWindow",
+            FunctionDescriptor.of(JAVA_LONG, ADDRESS));
+    private static final MethodHandle XGetPointerMapping = bind(X11, "XGetPointerMapping",
+            FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT));
     private static final MethodHandle XQueryPointer = bind(X11, "XQueryPointer",
             FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_LONG, ADDRESS, ADDRESS, ADDRESS, ADDRESS, ADDRESS, ADDRESS,
                     ADDRESS));
@@ -253,6 +278,15 @@ final class X11WindowEvents implements AutoCloseable {
     private final StringBuilder chars = new StringBuilder();
     private double scrollX;
     private double scrollY;
+    /** Core button-mask bits pressed / released since the last {@link #drainButtonEdges}. */
+    private int buttonsPressed;
+    private int buttonsReleased;
+    /** Keycode bitmaps, laid out as {@code XQueryKeymap}'s, pressed / released since the last {@link #drainKeyEdges}. */
+    private final byte[] keysPressed = new byte[32];
+    private final byte[] keysReleased = new byte[32];
+
+    /** Physical button (index) to logical, as the server maps them (left-handed swaps); pump thread only. */
+    private byte[] pointerMapping = new byte[0];
 
     private volatile boolean focused;
     private volatile boolean pointerInside;
@@ -283,6 +317,7 @@ final class X11WindowEvents implements AutoCloseable {
                         + minor.get(JAVA_INT, 0) + ")");
             }
             select();
+            readPointerMapping();
             readInitialState();
             loadAxes();
             this.stopPipe = pipe();
@@ -308,7 +343,33 @@ final class X11WindowEvents implements AutoCloseable {
         em.set(JAVA_INT, off(XIEventMask, "mask_len"), 4);
         em.set(ADDRESS, off(XIEventMask, "mask"), mask);
         int ignored = (int) XISelectEvents.invokeExact(display, window, em, 1);
-        int ignored2 = (int) XFlush.invokeExact(display);
+
+        // Raw events are only ever delivered to selections on the root window.
+        MemorySegment rawMask = arena.allocate(4);
+        for (int type : new int[]{XI_RawKeyPress, XI_RawKeyRelease, XI_RawButtonPress, XI_RawButtonRelease}) {
+            int b = type / 8;
+            rawMask.set(ValueLayout.JAVA_BYTE, b,
+                    (byte) (rawMask.get(ValueLayout.JAVA_BYTE, b) | (1 << (type % 8))));
+        }
+        MemorySegment rawEm = arena.allocate(XIEventMask);
+        rawEm.set(JAVA_INT, off(XIEventMask, "deviceid"), XIAllMasterDevices);
+        rawEm.set(JAVA_INT, off(XIEventMask, "mask_len"), 4);
+        rawEm.set(ADDRESS, off(XIEventMask, "mask"), rawMask);
+        long root = (long) XDefaultRootWindow.invokeExact(display);
+        int ignored2 = (int) XISelectEvents.invokeExact(display, root, rawEm, 1);
+        int ignored3 = (int) XFlush.invokeExact(display);
+    }
+
+    /**
+     * The server's physical-to-logical button map. A raw event's button is the physical one, before the map that
+     * swaps left and right for a left-handed mouse; the button state the backend polls is after it.
+     */
+    private void readPointerMapping() throws Throwable {
+        try (Arena temp = Arena.ofConfined()) {
+            MemorySegment map = temp.allocate(256);
+            int n = (int) XGetPointerMapping.invokeExact(display, map, 256);
+            pointerMapping = map.asSlice(0, Math.max(0, Math.min(n, 256))).toArray(ValueLayout.JAVA_BYTE);
+        }
     }
 
     /**
@@ -412,7 +473,10 @@ final class X11WindowEvents implements AutoCloseable {
             while (!stopping) {
                 while ((int) XPending.invokeExact(display) > 0) {
                     int ignored = (int) XNextEvent.invokeExact(display, event);
-                    if (event.get(JAVA_INT, 0) == GenericEvent
+                    if (event.get(JAVA_INT, 0) == MappingNotify
+                            && event.get(JAVA_INT, MAPPING_REQUEST_OFFSET) == MappingPointer) {
+                        readPointerMapping();
+                    } else if (event.get(JAVA_INT, 0) == GenericEvent
                             && event.get(JAVA_INT, off(XGenericEventCookie, "extension")) == xiOpcode
                             && (int) XGetEventData.invokeExact(display, event) != 0) {
                         try {
@@ -451,6 +515,37 @@ final class X11WindowEvents implements AutoCloseable {
             xkb.reset();   // a dead key pressed here does not carry into another window
         } else if (evtype == XI_DeviceChanged) {
             loadAxes();
+        } else if (evtype == XI_RawButtonPress || evtype == XI_RawButtonRelease) {
+            onRawButton(evtype == XI_RawButtonPress, e.get(JAVA_INT, off(XIDeviceEvent, "detail")));
+        } else if (evtype == XI_RawKeyPress || evtype == XI_RawKeyRelease) {
+            onRawKey(evtype == XI_RawKeyPress, e.get(JAVA_INT, off(XIDeviceEvent, "detail")));
+        }
+    }
+
+    /** {@code detail} sits at the same offset in {@code XIRawEvent} as in {@code XIDeviceEvent}. */
+    private void onRawButton(boolean press, int physical) {
+        int logical = physical >= 1 && physical <= pointerMapping.length
+                ? pointerMapping[physical - 1] & 0xFF : physical;
+        int bit = buttonMask(logical);
+        if (bit == 0) {
+            return;   // the wheel and side buttons
+        }
+        synchronized (lock) {
+            if (press) {
+                buttonsPressed |= bit;
+            } else {
+                buttonsReleased |= bit;
+            }
+        }
+    }
+
+    private void onRawKey(boolean press, int keycode) {
+        if (keycode <= 0 || keycode >= 256) {
+            return;
+        }
+        synchronized (lock) {
+            byte[] into = press ? keysPressed : keysReleased;
+            into[keycode / 8] |= (byte) (1 << (keycode % 8));
         }
     }
 
@@ -546,6 +641,29 @@ final class X11WindowEvents implements AutoCloseable {
             scrollX = 0;
             scrollY = 0;
             return d;
+        }
+    }
+
+    /**
+     * The core button-mask bits pressed and released since the last call, resetting both: pressed in the low 32
+     * bits, released in the high.
+     */
+    long drainButtonEdges() {
+        synchronized (lock) {
+            long edges = Integer.toUnsignedLong(buttonsPressed) | ((long) buttonsReleased << 32);
+            buttonsPressed = 0;
+            buttonsReleased = 0;
+            return edges;
+        }
+    }
+
+    /** Copy the keycodes pressed and released since the last call into the two 32-byte bitmaps, resetting them. */
+    void drainKeyEdges(byte[] pressed, byte[] released) {
+        synchronized (lock) {
+            System.arraycopy(keysPressed, 0, pressed, 0, 32);
+            System.arraycopy(keysReleased, 0, released, 0, 32);
+            Arrays.fill(keysPressed, (byte) 0);
+            Arrays.fill(keysReleased, (byte) 0);
         }
     }
 
