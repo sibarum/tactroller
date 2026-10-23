@@ -98,6 +98,17 @@ public final class WindowsInputBackend implements InputBackend {
 
     private final Map<Key, Integer> vkByKey = buildKeyMap();
     private final Map<Integer, Key> keyByVk = invert(vkByKey);
+    /**
+     * {@link #vkByKey} flattened into parallel arrays, in {@link Key} order, so {@link #pollKeys()} walks the mapped
+     * keys with no boxing, no {@code Key.values()} clone and no map lookup. Built once; never written after.
+     */
+    private final Key[] polledKeys = vkByKey.keySet().toArray(new Key[0]);
+    private final int[] polledVks = vkByKey.values().stream().mapToInt(Integer::intValue).toArray();
+    /**
+     * Every combination of the three polled buttons, indexed by bit (LEFT 1, RIGHT 2, MIDDLE 4). Unmodifiable, so
+     * {@link PointerState}'s {@code Set.copyOf} keeps the instance instead of copying it.
+     */
+    private static final Set<MouseButton>[] BUTTON_SETS = buttonSets();
 
     // Accumulators fed by the WndProc (pump thread), drained by the loop/poll thread.
     private final AtomicInteger rawDx = new AtomicInteger();
@@ -304,11 +315,8 @@ public final class WindowsInputBackend implements InputBackend {
             }
             int x = pointBuffer.get(JAVA_INT, 0);
             int y = pointBuffer.get(JAVA_INT, 4);
-            Set<MouseButton> buttons = EnumSet.noneOf(MouseButton.class);
-            if (down(VK_LBUTTON)) buttons.add(MouseButton.LEFT);
-            if (down(VK_RBUTTON)) buttons.add(MouseButton.RIGHT);
-            if (down(VK_MBUTTON)) buttons.add(MouseButton.MIDDLE);
-            return new PointerState(x, y, buttons);
+            int held = (down(VK_LBUTTON) ? 1 : 0) | (down(VK_RBUTTON) ? 2 : 0) | (down(VK_MBUTTON) ? 4 : 0);
+            return new PointerState(x, y, BUTTON_SETS[held]);
         } catch (BackendException e) {
             throw e;
         } catch (Throwable t) {
@@ -327,6 +335,30 @@ public final class WindowsInputBackend implements InputBackend {
         } catch (Throwable t) {
             throw new BackendException("Native key poll failed for " + key, t);
         }
+    }
+
+    /**
+     * One {@code GetAsyncKeyState} per mapped key, exactly as the interface default's per-key {@link #isKeyDown}
+     * would make, without its boxed map lookups or its {@code Key.values()} clone. An unattended window sees nothing
+     * held, as through {@link #down}.
+     */
+    @Override
+    public Set<Key> pollKeys() throws BackendException {
+        EnumSet<Key> held = EnumSet.noneOf(Key.class);
+        Key[] keys = polledKeys;
+        int[] vks = polledVks;
+        for (int i = 0; i < keys.length; i++) {
+            boolean isDown;
+            try {
+                isDown = down(vks[i]);
+            } catch (Throwable t) {
+                throw new BackendException("Native key poll failed for " + keys[i], t);
+            }
+            if (isDown) {
+                held.add(keys[i]);
+            }
+        }
+        return held;
     }
 
     @Override
@@ -805,6 +837,22 @@ public final class WindowsInputBackend implements InputBackend {
 
     private static RuntimeException wrap(String msg, Throwable t) {
         return new RuntimeException(msg, t);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Set<MouseButton>[] buttonSets() {
+        Set<MouseButton>[] sets = new Set[8];
+        MouseButton[] bits = {MouseButton.LEFT, MouseButton.RIGHT, MouseButton.MIDDLE};
+        for (int mask = 0; mask < sets.length; mask++) {
+            EnumSet<MouseButton> s = EnumSet.noneOf(MouseButton.class);
+            for (int b = 0; b < bits.length; b++) {
+                if ((mask & (1 << b)) != 0) {
+                    s.add(bits[b]);
+                }
+            }
+            sets[mask] = Set.copyOf(s);
+        }
+        return sets;
     }
 
     private static Map<Integer, Key> invert(Map<Key, Integer> vkByKey) {
