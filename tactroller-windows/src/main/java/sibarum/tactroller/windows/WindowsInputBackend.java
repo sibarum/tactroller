@@ -2,6 +2,7 @@ package sibarum.tactroller.windows;
 
 import sibarum.tactroller.api.BackendException;
 import sibarum.tactroller.api.InputBackend;
+import sibarum.tactroller.api.InputEdge;
 import sibarum.tactroller.api.Key;
 import sibarum.tactroller.api.MouseButton;
 import sibarum.tactroller.api.NativeWindow;
@@ -20,8 +21,10 @@ import java.lang.foreign.SymbolLookup;
 import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.MethodType;
+import java.util.ArrayDeque;
 import java.util.EnumMap;
 import java.util.EnumSet;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -43,10 +46,12 @@ import static java.lang.foreign.ValueLayout.JAVA_SHORT;
  * focal channels (keys, typed text) and {@link #isPointerTarget()} for positional ones (wheel, pointer).
  *
  * <p>Scroll wheel, raw relative motion and typed text cannot be polled on Windows — they arrive via RawInput,
- * which is <b>process-scoped</b>: one registration per usage pair wins for the entire process. That half lives
- * in {@link WindowsRawInputHub}, which runs a single pump for the process and fans every report into every
- * live backend through {@link #acceptRawMouse} / {@link #acceptChars}; the loop thread then drains this
- * instance's accumulators via {@link #drainScroll()} / {@link #drainPointerDelta()} / {@link #drainChars()}.
+ * which is <b>process-scoped</b>: one registration per usage pair wins for the entire process. Neither can a
+ * click quicker than a frame, which polled button state never shows, so the key and button presses and releases
+ * themselves come that way too. That half lives in {@link WindowsRawInputHub}, which runs a single pump for the
+ * process and fans every report into every live backend through {@link #acceptRawMouse} / {@link #acceptChars} /
+ * {@link #acceptButton} / {@link #acceptRawKey}; the loop thread then drains this instance's accumulators via
+ * {@link #drainScroll()} / {@link #drainPointerDelta()} / {@link #drainChars()} / {@link #drainEdges()}.
  *
  * <p><b>Keep that split.</b> Anything process- or globally-scoped belongs in the hub, never here — a
  * per-instance registration silently steals input from every other window. {@code RawInputScopeGuardTest}
@@ -63,6 +68,14 @@ public final class WindowsInputBackend implements InputBackend {
     private static final int VK_SHIFT = 0x10;
     private static final int VK_CONTROL = 0x11;
     private static final int VK_MENU = 0x12; // ALT
+    private static final int VK_LSHIFT = 0xA0;
+    private static final int VK_RSHIFT = 0xA1;
+    private static final int VK_LCONTROL = 0xA2;
+    private static final int VK_RCONTROL = 0xA3;
+    private static final int VK_LMENU = 0xA4;
+    private static final int VK_RMENU = 0xA5;
+    private static final int SCAN_RIGHT_SHIFT = 0x36;
+    private static final int EDGE_QUEUE_LIMIT = 512;
     private static final int WHEEL_DELTA = 120;
     private static final int SM_CXSCREEN = 0;
     private static final int SM_CYSCREEN = 1;
@@ -84,6 +97,7 @@ public final class WindowsInputBackend implements InputBackend {
             JAVA_INT.withName("x"), JAVA_INT.withName("y"));
 
     private final Map<Key, Integer> vkByKey = buildKeyMap();
+    private final Map<Integer, Key> keyByVk = invert(vkByKey);
 
     // Accumulators fed by the WndProc (pump thread), drained by the loop/poll thread.
     private final AtomicInteger rawDx = new AtomicInteger();
@@ -93,6 +107,9 @@ public final class WindowsInputBackend implements InputBackend {
     // Typed characters (UTF-16 units) accumulated on the pump thread, drained by the loop/poll thread.
     private final StringBuilder charBuf = new StringBuilder();
     private final Object charLock = new Object();
+    // Key and button edges, in order, queued on the pump thread, drained by the loop/poll thread.
+    private final ArrayDeque<InputEdge> edgeQueue = new ArrayDeque<>();
+    private final Object edgeLock = new Object();
     // The latest touchpad frame (immutable) and when it arrived, published by the pump thread.
     private volatile List<TouchpadContact> touchpad = List.of();
     private volatile long touchpadNanos;
@@ -207,6 +224,59 @@ public final class WindowsInputBackend implements InputBackend {
         }
     }
 
+    /**
+     * Accept one button press or release fanned from {@link WindowsRawInputHub}, the cursor at {@code (x, y)} in
+     * screen pixels. Pump thread.
+     */
+    void acceptButton(MouseButton button, boolean down, int x, int y, long nanos) {
+        queueEdge(InputEdge.button(button, down, x, y, nanos));
+    }
+
+    /**
+     * Accept one raw key report fanned from {@link WindowsRawInputHub}, as the virtual key the poll reads it by.
+     * Pump thread.
+     *
+     * <p>A raw report names a modifier by its generic virtual key ({@code VK_SHIFT}, {@code VK_CONTROL}, {@code
+     * VK_MENU}), where the poll asks for each side ({@code VK_LSHIFT}, ...); which side is in the scan code for
+     * Shift and in the extended flag for Control and Alt. Anything else not in the key map (the {@code 0xFF} that
+     * prefixes escaped sequences, keys {@link Key} has no name for) is not an edge the poll could agree with, so it
+     * is not queued.
+     */
+    void acceptRawKey(int vKey, int makeCode, boolean extended, boolean down, long nanos) {
+        Key key = keyByVk.get(sided(vKey, makeCode, extended));
+        if (key != null) {
+            queueEdge(InputEdge.key(key, down, nanos));
+        }
+    }
+
+    /** A modifier's generic virtual key as the virtual key for its side; any other key as it is. */
+    private static int sided(int vKey, int makeCode, boolean extended) {
+        if (vKey == VK_SHIFT) {
+            return makeCode == SCAN_RIGHT_SHIFT ? VK_RSHIFT : VK_LSHIFT;
+        }
+        if (vKey == VK_CONTROL) {
+            return extended ? VK_RCONTROL : VK_LCONTROL;
+        }
+        if (vKey == VK_MENU) {
+            return extended ? VK_RMENU : VK_LMENU;
+        }
+        return vKey;
+    }
+
+    /**
+     * Pump thread. Bounded, because nothing obliges anyone to drain: a backend used only to read the pointer would
+     * otherwise keep every keystroke on the desktop (the keyboard is registered INPUTSINK). The oldest go first, and
+     * losing them is safe, because the poll still settles state; only the clicks in between are lost.
+     */
+    private void queueEdge(InputEdge edge) {
+        synchronized (edgeLock) {
+            if (edgeQueue.size() == EDGE_QUEUE_LIMIT) {
+                edgeQueue.removeFirst();
+            }
+            edgeQueue.addLast(edge);
+        }
+    }
+
     /** Accept typed UTF-16 units fanned from {@link WindowsRawInputHub}. Pump thread. */
     void acceptChars(CharSequence produced) {
         synchronized (charLock) {
@@ -306,6 +376,22 @@ public final class WindowsInputBackend implements InputBackend {
             return NO_CHARS;
         }
         return s.codePoints().toArray(); // fold any UTF-16 surrogate pairs into single code points
+    }
+
+    @Override
+    public List<InputEdge> drainEdges() {
+        List<InputEdge> edges;
+        synchronized (edgeLock) {
+            if (edgeQueue.isEmpty()) {
+                return List.of();
+            }
+            edges = List.copyOf(edgeQueue);
+            edgeQueue.clear();
+        }
+        if (unattended) {
+            return List.of();
+        }
+        return edges;
     }
 
     @Override
@@ -719,6 +805,12 @@ public final class WindowsInputBackend implements InputBackend {
 
     private static RuntimeException wrap(String msg, Throwable t) {
         return new RuntimeException(msg, t);
+    }
+
+    private static Map<Integer, Key> invert(Map<Key, Integer> vkByKey) {
+        Map<Integer, Key> m = new HashMap<>();
+        vkByKey.forEach((key, vk) -> m.put(vk, key));
+        return m;
     }
 
     private static Map<Key, Integer> buildKeyMap() {

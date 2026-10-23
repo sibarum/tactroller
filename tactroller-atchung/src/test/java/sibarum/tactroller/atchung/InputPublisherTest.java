@@ -2,6 +2,7 @@ package sibarum.tactroller.atchung;
 
 import org.junit.jupiter.api.Test;
 import sibarum.atchung.Atchung;
+import sibarum.tactroller.api.InputEdge;
 import sibarum.tactroller.api.InputEvent;
 import sibarum.tactroller.api.InputFrame;
 import sibarum.tactroller.api.Key;
@@ -303,6 +304,60 @@ class InputPublisherTest {
         assertEquals(MouseButton.LEFT, bp.button());
         assertEquals(10, bp.x());
         assertEquals(20, bp.y());
+    }
+
+    /** A frame carrying ordered edges, nothing held at the end of it, over this window. */
+    private static InputFrame edges(InputEdge... edges) {
+        return new InputFrame(Set.of(), Set.of(), Set.of(), Set.of(), Set.of(), Set.of(),
+                Set.of(), 5, 6, PointerDelta.ZERO, ScrollDelta.ZERO, true, 1L, new int[0], true, List.of(), List.of(edges));
+    }
+
+    /**
+     * A frame's edges are published one by one, in order, each at its own place and time. Two clicks inside one
+     * frame are two clicks: as sets they were one press and one release, and before that, when edges were read off
+     * polled state, nothing at all.
+     */
+    @Test
+    void edgesArePublishedInOrderAtTheirOwnPlaceAndTime() {
+        Atchung bus = Atchung.create();
+        InputPublisher pub = new InputPublisher(bus);
+        List<InputEvent> got = new ArrayList<>();
+        bus.subscribe(pub.events(), got::add);
+
+        pub.publish(edges(
+                InputEdge.button(MouseButton.LEFT, true, 1, 2, 10L),
+                InputEdge.button(MouseButton.LEFT, false, 1, 2, 20L),
+                InputEdge.button(MouseButton.LEFT, true, 3, 4, 30L),
+                InputEdge.button(MouseButton.LEFT, false, 3, 4, 40L)));
+
+        assertEquals(List.of(
+                new InputEvent.ButtonPressed(MouseButton.LEFT, 1, 2, 10L),
+                new InputEvent.ButtonReleased(MouseButton.LEFT, 1, 2, 20L),
+                new InputEvent.ButtonPressed(MouseButton.LEFT, 3, 4, 30L),
+                new InputEvent.ButtonReleased(MouseButton.LEFT, 3, 4, 40L)), got);
+    }
+
+    /**
+     * Release, then press again, inside one frame: the button ends the frame down, and the consumer must believe so.
+     * Published as a set (press before release) it would believe the opposite, and the next drag would never start.
+     */
+    @Test
+    void aReleaseAndPressInsideOneFrameEndDown() {
+        Atchung bus = Atchung.create();
+        InputPublisher pub = new InputPublisher(bus);
+        List<InputEvent> got = new ArrayList<>();
+        bus.subscribe(pub.events(), got::add);
+
+        pub.publish(edges(InputEdge.button(MouseButton.LEFT, true, 1, 2, 10L)));
+        got.clear();
+        pub.publish(edges(InputEdge.button(MouseButton.LEFT, false, 1, 2, 20L),
+                InputEdge.button(MouseButton.LEFT, true, 1, 2, 30L)));
+        assertTrue(got.getLast() instanceof InputEvent.ButtonPressed);
+
+        got.clear();
+        pub.publish(moved(Set.of(MouseButton.LEFT), Set.of(), new PointerDelta(3, 0), false));
+        assertTrue(got.stream().anyMatch(e -> e instanceof InputEvent.PointerMoved),
+                "the button is down, so the motion is a drag and follows it out of the window");
     }
 
     @Test

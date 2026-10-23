@@ -67,8 +67,8 @@ public interface InputBackend extends AutoCloseable {
      * (e.g. X11's {@code XQueryKeymap}) should override this for efficiency and to keep every key
      * in the snapshot consistent to the same instant.
      *
-     * <p>Used by the shared event loop to derive {@code KeyPressed}/{@code KeyReleased} events, so
-     * the semantics of this method are identical across platforms by construction.
+     * <p>Used by the shared event loop to derive {@code KeyPressed}/{@code KeyReleased} events, together with
+     * {@link #drainEdges()}, so the semantics of this method are identical across platforms by construction.
      *
      * @return the set of pressed keys; never {@code null}
      * @throws BackendException if the native query failed
@@ -268,6 +268,26 @@ public interface InputBackend extends AutoCloseable {
      */
     default int[] drainChars() {
         return NO_CHARS;
+    }
+
+    // ---- Key and button edges ----------------------------------------------
+
+    /**
+     * Drain the key and button presses and releases seen since the last call, in the order they happened, resetting
+     * the queue. Button positions are screen pixels, taken when the edge happened.
+     *
+     * <p>Polling sees state, and a press and release that both fall between two polls leave none, so without this a
+     * click quicker than a frame is lost. The queue is not the authority on state, though: {@link #pollPointer()}
+     * and {@link #pollKeys()} still are, and the caller settles the two, dropping a queued edge the poll already
+     * accounted for and adding one the queue has not delivered yet. So a backend may queue an edge late, or miss
+     * one, without leaving anything stuck.
+     *
+     * <p>Like {@link #drainChars()} this is filled on the backend's native pump thread and drained by the loop/poll
+     * thread. A backend that is not an event source for keys and buttons returns an empty list, and its edges are
+     * the difference between two polls.
+     */
+    default List<InputEdge> drainEdges() {
+        return List.of();
     }
 
     // ---- Touchpad contacts ------------------------------------------------

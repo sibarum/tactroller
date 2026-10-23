@@ -1,5 +1,6 @@
 package sibarum.tactroller.api;
 
+import java.util.EnumSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
@@ -40,7 +41,8 @@ import sibarum.probe.Zone;
  * }</pre>
  *
  * <p>The event loop lives entirely in this API module: it samples the backend (absolute pointer,
- * keys) and drains its accumulators (scroll, relative motion), then diffs and emits
+ * keys) and drains its accumulators (scroll, relative motion, queued key and button edges), then
+ * settles the queued edges against the sampled state ({@link EdgeLedger}) and emits
  * {@link InputEvent}s. That derivation is the same code on every OS, so the event stream is
  * identical regardless of the native backend underneath.
  *
@@ -89,10 +91,9 @@ public final class Tactroller implements AutoCloseable {
     private int pollDeltaX;
     private int pollDeltaY;
 
-    // Baseline for snapshot() edge diffing (render-thread polling path).
+    // Baseline for snapshot() edges and motion (render-thread polling path).
+    private final EdgeLedger snapEdges = new EdgeLedger();
     private boolean snapPrimed;
-    private Set<Key> snapPrevKeys = Set.of();
-    private Set<MouseButton> snapPrevButtons = Set.of();
     private int snapPrevX;
     private int snapPrevY;
 
@@ -228,11 +229,15 @@ public final class Tactroller implements AutoCloseable {
         boolean pointerTarget = backend.isPointerTarget();
         ScrollDelta scroll = backend.drainScroll();
         int[] chars = backend.drainChars();
+        // Drained before the poll, so every queued edge happened before the state read below: the poll can be
+        // ahead of the queue (EdgeLedger settles that), never behind it, which would read as a click that never was.
+        List<InputEdge> queued = backend.drainEdges();
         PointerState p = backend.pollPointer();
         Set<Key> keys = backend.pollKeys();
         List<TouchpadContact> touchpad = backend.pollTouchpad();
         Set<MouseButton> buttons = p.buttons();
-        int[] xy = project(p.x(), p.y(), coordinateSpace);
+        CoordinateSpace space = coordinateSpace;
+        int[] xy = project(p.x(), p.y(), space);
         long now = System.nanoTime();
 
         PointerDelta motion;
@@ -244,40 +249,64 @@ public final class Tactroller implements AutoCloseable {
             motion = PointerDelta.ZERO;
         }
 
-        Set<Key> pressedKeys = snapPrimed ? minus(keys, snapPrevKeys) : Set.of();
-        Set<Key> releasedKeys = snapPrimed ? minus(snapPrevKeys, keys) : Set.of();
-        Set<MouseButton> pressedBtn = snapPrimed ? minus(buttons, snapPrevButtons) : Set.of();
-        Set<MouseButton> releasedBtn = snapPrimed ? minus(snapPrevButtons, buttons) : Set.of();
+        List<InputEdge> edges = snapEdges.settle(queued, keys, buttons, xy[0], xy[1], now,
+                (sx, sy) -> project(sx, sy, space));
+        EdgeSets sets = edges.isEmpty() ? EdgeSets.NONE : new EdgeSets(edges);
 
         InputFrame frame = new InputFrame(
-                keys, pressedKeys, releasedKeys,
-                buttons, pressedBtn, releasedBtn,
+                keys, sets.pressedKeys, sets.releasedKeys,
+                buttons, sets.pressedButtons, sets.releasedButtons,
                 Modifier.from(keys),
-                xy[0], xy[1], motion, scroll, focused, now, chars, pointerTarget, touchpad);
+                xy[0], xy[1], motion, scroll, focused, now, chars, pointerTarget, touchpad, edges);
 
         // How much actually happened this frame. A frame loop that is busy with nothing to do and a frame
         // loop drowning in edges look identical from the outside and are opposite problems; this is the line
         // that tells them apart, and its peak is the input storm.
         if (Probe.ON) {
-            Probe.count(Lane.INPUT, "edges", pressedKeys.size() + releasedKeys.size()
-                    + pressedBtn.size() + releasedBtn.size() + chars.length);
+            Probe.count(Lane.INPUT, "edges", edges.size() + chars.length);
         }
 
-        snapPrevKeys = keys;
-        snapPrevButtons = buttons;
         snapPrevX = xy[0];
         snapPrevY = xy[1];
         snapPrimed = true;
         return frame;
     }
 
-    private static <T extends Enum<T>> Set<T> minus(Set<T> a, Set<T> b) {
-        if (a.isEmpty()) {
-            return Set.of();
+    /** A frame's edge sets, read off its edges: whatever was pressed, or released, at least once. */
+    private static final class EdgeSets implements InputEdge.Sink {
+        /** The common frame's, with nothing in it. Never handed an edge, so never written. */
+        static final EdgeSets NONE = new EdgeSets(List.of());
+
+        final EnumSet<Key> pressedKeys = EnumSet.noneOf(Key.class);
+        final EnumSet<Key> releasedKeys = EnumSet.noneOf(Key.class);
+        final EnumSet<MouseButton> pressedButtons = EnumSet.noneOf(MouseButton.class);
+        final EnumSet<MouseButton> releasedButtons = EnumSet.noneOf(MouseButton.class);
+
+        EdgeSets(List<InputEdge> edges) {
+            for (InputEdge e : edges) {
+                e.to(this);
+            }
         }
-        java.util.EnumSet<T> r = java.util.EnumSet.copyOf(a);
-        r.removeAll(b);
-        return r;
+
+        @Override
+        public void keyPressed(Key key, long timestampNanos) {
+            pressedKeys.add(key);
+        }
+
+        @Override
+        public void keyReleased(Key key, long timestampNanos) {
+            releasedKeys.add(key);
+        }
+
+        @Override
+        public void buttonPressed(MouseButton button, int x, int y, long timestampNanos) {
+            pressedButtons.add(button);
+        }
+
+        @Override
+        public void buttonReleased(MouseButton button, int x, int y, long timestampNanos) {
+            releasedButtons.add(button);
+        }
     }
 
     // ---- Window attachment, focus, coordinate space ----------------------
@@ -478,8 +507,8 @@ public final class Tactroller implements AutoCloseable {
     }
 
     private void runLoop(long periodNanos) {
-        Set<Key> prevKeys = Set.of();
-        Set<MouseButton> prevButtons = Set.of();
+        EdgeLedger ledger = new EdgeLedger();
+        InputEdge.Sink emit = new EdgeEvents();
         int prevX = 0;
         int prevY = 0;
         boolean primed = false;
@@ -496,6 +525,7 @@ public final class Tactroller implements AutoCloseable {
                 PointerDelta relMotion = backend.drainPointerDelta();
                 ScrollDelta scroll = backend.drainScroll();
                 int[] chars = backend.drainChars();
+                List<InputEdge> queued = backend.drainEdges();   // before the poll, as in takeSnapshot
                 PointerState pointer = backend.pollPointer();
                 Set<Key> keys = backend.pollKeys();
                 List<TouchpadContact> touchpad = backend.pollTouchpad();
@@ -504,7 +534,11 @@ public final class Tactroller implements AutoCloseable {
                 // Snapshot the coordinate space once and project once, so both the emitted position
                 // and the baseline stored for the next tick live in the same space even if
                 // setCoordinateSpace() runs concurrently mid-tick.
-                int[] xy = project(pointer.x(), pointer.y(), coordinateSpace);
+                CoordinateSpace space = coordinateSpace;
+                int[] xy = project(pointer.x(), pointer.y(), space);
+                // Settled even while gated, so the ledger keeps up and focus coming back is not a burst of old edges.
+                List<InputEdge> edges = ledger.settle(queued, keys, pointer.buttons(), xy[0], xy[1], now,
+                        (sx, sy) -> project(sx, sy, space));
 
                 if (focused != prevFocused && backend.isWindowAttached()) {
                     dispatch(new InputEvent.FocusChanged(focused, now));
@@ -514,8 +548,9 @@ public final class Tactroller implements AutoCloseable {
                 if (!gated && primed) {
                     emitMotion(prevX, prevY, xy, pointer, relMotion, now);
                     emitScroll(scroll, xy, now);
-                    emitButtons(prevButtons, pointer, xy, now);
-                    emitKeys(prevKeys, keys, now);
+                    for (InputEdge e : edges) {
+                        e.to(emit);
+                    }
                     emitChars(chars, now);
                 }
                 // Contacts are state: emit on any change, and an emptied surface even while gated, so a listener
@@ -525,8 +560,6 @@ public final class Tactroller implements AutoCloseable {
                     prevTouchpad = touchpad;
                 }
 
-                prevKeys = keys;
-                prevButtons = pointer.buttons();
                 prevX = xy[0];
                 prevY = xy[1];
                 primed = true;
@@ -586,28 +619,26 @@ public final class Tactroller implements AutoCloseable {
         }
     }
 
-    private void emitButtons(Set<MouseButton> prev, PointerState now, int[] xy, long ts) {
-        for (MouseButton b : MouseButton.values()) {
-            boolean was = prev.contains(b);
-            boolean is = now.isPressed(b);
-            if (is && !was) {
-                dispatch(new InputEvent.ButtonPressed(b, xy[0], xy[1], ts));
-            } else if (!is && was) {
-                dispatch(new InputEvent.ButtonReleased(b, xy[0], xy[1], ts));
-            }
+    /** The event loop's edges, each dispatched as the event it is, at its own time and place. */
+    private final class EdgeEvents implements InputEdge.Sink {
+        @Override
+        public void keyPressed(Key key, long timestampNanos) {
+            dispatch(new InputEvent.KeyPressed(key, timestampNanos));
         }
-    }
 
-    private void emitKeys(Set<Key> prev, Set<Key> now, long ts) {
-        for (Key k : now) {
-            if (!prev.contains(k)) {
-                dispatch(new InputEvent.KeyPressed(k, ts));
-            }
+        @Override
+        public void keyReleased(Key key, long timestampNanos) {
+            dispatch(new InputEvent.KeyReleased(key, timestampNanos));
         }
-        for (Key k : prev) {
-            if (!now.contains(k)) {
-                dispatch(new InputEvent.KeyReleased(k, ts));
-            }
+
+        @Override
+        public void buttonPressed(MouseButton button, int x, int y, long timestampNanos) {
+            dispatch(new InputEvent.ButtonPressed(button, x, y, timestampNanos));
+        }
+
+        @Override
+        public void buttonReleased(MouseButton button, int x, int y, long timestampNanos) {
+            dispatch(new InputEvent.ButtonReleased(button, x, y, timestampNanos));
         }
     }
 

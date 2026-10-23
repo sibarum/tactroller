@@ -4,6 +4,7 @@ import sibarum.atchung.Atchung;
 import sibarum.atchung.Committer;
 import sibarum.atchung.State;
 import sibarum.atchung.Topic;
+import sibarum.tactroller.api.InputEdge;
 import sibarum.tactroller.api.InputEvent;
 import sibarum.tactroller.api.InputFrame;
 import sibarum.tactroller.api.Key;
@@ -13,6 +14,7 @@ import sibarum.tactroller.api.PointerState;
 import sibarum.tactroller.api.ScrollDelta;
 import sibarum.tactroller.api.TouchpadContact;
 
+import java.util.EnumSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
@@ -78,7 +80,8 @@ public final class InputPublisher {
     /** Keys last published as held while focused -- what a consumer currently believes is down. */
     private Set<Key> heldWhileFocused = Set.of();
     /** Buttons whose press this publisher delivered -- what a consumer currently believes is down. */
-    private Set<MouseButton> heldSincePress = Set.of();
+    private final EnumSet<MouseButton> heldSincePress = EnumSet.noneOf(MouseButton.class);
+    private final EdgeGates edgeGates = new EdgeGates();
     /** The touchpad contacts last published -- what a consumer currently believes is on the surface. */
     private List<TouchpadContact> publishedTouchpad = List.of();
 
@@ -111,36 +114,13 @@ public final class InputPublisher {
         boolean focal = f.focused();               // keys/text: the focused window's
         boolean positional = f.pointerTarget();  // wheel/pointer: the window under the cursor
 
-        if (focal) {
-            for (Key k : f.pressedKeys()) {
-                bus.publish(events, new InputEvent.KeyPressed(k, ts));
-            }
-            for (Key k : f.releasedKeys()) {
-                bus.publish(events, new InputEvent.KeyReleased(k, ts));
-            }
+        // Key and button edges, one at a time and in the order they happened, so that a click that began and ended
+        // inside the frame is a press then a release, and a double click is two of each, not one or none.
+        edgeGates.focal = focal;
+        edgeGates.positional = positional;
+        for (InputEdge e : f.edges()) {
+            e.to(edgeGates);
         }
-        if (positional) {
-            for (MouseButton btn : f.pressedButtons()) {
-                bus.publish(events, new InputEvent.ButtonPressed(btn, f.pointerX(), f.pointerY(), ts));
-            }
-        }
-        // A button RELEASE is deliberately not behind the positional gate, and this is the same rule the focus
-        // unwind below states for keys: a gate on *delivery* must not desynchronize *state*. Press the pointer
-        // inside this window, drag out past its edge, let go -- the release edge is in the frame (the backend
-        // polls buttons whatever the pointer is over), but the gate would drop it, and the consumer would keep
-        // the button latched forever. In a GUI that means a drag that never ends: the plot stays stuck to the
-        // pointer until a fresh click somewhere inside resets it.
-        //
-        // Ungating is safe for the reason a release is always safe -- it is inert, it can only end things. What
-        // it must not do is invent one, so a release is delivered only for a button whose PRESS this publisher
-        // delivered. That is also what keeps two windows out of each other's business: press inside window A
-        // and release over window B, and only A ever published the press, so only A publishes the release.
-        for (MouseButton btn : f.releasedButtons()) {
-            if (heldSincePress.contains(btn)) {
-                bus.publish(events, new InputEvent.ButtonReleased(btn, f.pointerX(), f.pointerY(), ts));
-            }
-        }
-        heldSincePress = nowHeld(heldSincePress, f, positional);
 
         if (positional) {
             ScrollDelta scroll = f.scroll();
@@ -223,22 +203,56 @@ public final class InputPublisher {
         }
     }
 
-    /**
-     * What a consumer believes is down after this frame: whatever it believed, less anything released, plus
-     * anything pressed <em>inside the client</em>. A press outside belongs to another window, so it is not
-     * added — which is what makes the ungated release above unable to fire for a press this publisher never
-     * delivered.
-     */
-    private static Set<MouseButton> nowHeld(Set<MouseButton> before, InputFrame f, boolean positional) {
-        if (before.isEmpty() && (!positional || f.pressedButtons().isEmpty())) {
-            return Set.of();
+    /** The routing gates applied to one edge at a time; {@link #focal} and {@link #positional} are the frame's. */
+    private final class EdgeGates implements InputEdge.Sink {
+        boolean focal;
+        boolean positional;
+
+        @Override
+        public void keyPressed(Key key, long timestampNanos) {
+            if (focal) {
+                bus.publish(events, new InputEvent.KeyPressed(key, timestampNanos));
+            }
         }
-        java.util.EnumSet<MouseButton> held = java.util.EnumSet.noneOf(MouseButton.class);
-        held.addAll(before);
-        held.removeAll(f.releasedButtons());
-        if (positional) {
-            held.addAll(f.pressedButtons());
+
+        @Override
+        public void keyReleased(Key key, long timestampNanos) {
+            if (focal) {
+                bus.publish(events, new InputEvent.KeyReleased(key, timestampNanos));
+            }
         }
-        return held.isEmpty() ? Set.of() : Set.copyOf(held);
+
+        /**
+         * A press inside the client is this window's, and from it the window believes the button is down. A press
+         * outside belongs to another window, so it is neither published nor believed — which is what makes the
+         * ungated release below unable to fire for a press this publisher never delivered.
+         */
+        @Override
+        public void buttonPressed(MouseButton button, int x, int y, long timestampNanos) {
+            if (positional) {
+                bus.publish(events, new InputEvent.ButtonPressed(button, x, y, timestampNanos));
+                heldSincePress.add(button);
+            }
+        }
+
+        /**
+         * A button RELEASE is deliberately not behind the positional gate, and this is the same rule the focus
+         * unwind states for keys: a gate on *delivery* must not desynchronize *state*. Press the pointer inside this
+         * window, drag out past its edge, let go -- the release edge is in the frame (the backend reads buttons
+         * whatever the pointer is over), but the gate would drop it, and the consumer would keep the button latched
+         * forever. In a GUI that means a drag that never ends: the plot stays stuck to the pointer until a fresh
+         * click somewhere inside resets it.
+         *
+         * <p>Ungating is safe for the reason a release is always safe -- it is inert, it can only end things. What it
+         * must not do is invent one, so a release is delivered only for a button whose PRESS this publisher
+         * delivered. That is also what keeps two windows out of each other's business: press inside window A and
+         * release over window B, and only A ever published the press, so only A publishes the release.
+         */
+        @Override
+        public void buttonReleased(MouseButton button, int x, int y, long timestampNanos) {
+            if (heldSincePress.remove(button)) {
+                bus.publish(events, new InputEvent.ButtonReleased(button, x, y, timestampNanos));
+            }
+        }
     }
 }

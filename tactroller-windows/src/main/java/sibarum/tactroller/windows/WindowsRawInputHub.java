@@ -1,6 +1,7 @@
 package sibarum.tactroller.windows;
 
 import sibarum.tactroller.api.BackendException;
+import sibarum.tactroller.api.MouseButton;
 import sibarum.tactroller.api.TouchpadContact;
 
 import java.lang.foreign.Arena;
@@ -63,6 +64,10 @@ final class WindowsRawInputHub {
     private static final int RIM_TYPEHID = 2;
     private static final int RAWINPUT_BUFFER_BYTES = 1024; // a mouse/keyboard report is 48; a HID batch is larger
     private static final int RI_KEY_BREAK = 0x01; // key-up flag in RAWKEYBOARD.Flags
+    private static final int RI_KEY_E0 = 0x02;    // extended-key flag in RAWKEYBOARD.Flags (the right of a pair)
+    private static final int RI_MOUSE_LEFT_BUTTON_DOWN = 0x0001;   // each button's up flag is the bit above its down
+    private static final int RI_MOUSE_RIGHT_BUTTON_DOWN = 0x0004;
+    private static final int RI_MOUSE_MIDDLE_BUTTON_DOWN = 0x0010;
     private static final int RI_MOUSE_WHEEL = 0x0400;
     private static final int RI_MOUSE_HWHEEL = 0x0800;
     private static final int MOUSE_MOVE_ABSOLUTE = 0x01;
@@ -135,6 +140,8 @@ final class WindowsRawInputHub {
     private final MemorySegment uniBuffer;        // UTF-16 output for ToUnicodeEx (pump thread only)
 
     private final MethodHandle getAsyncKeyState;
+    private final MethodHandle getCursorPos;
+    private final MemorySegment cursorBuffer;     // reusable POINT for button edges (pump thread only)
     private final MethodHandle getModuleHandle;
     private final MethodHandle registerClassEx;
     private final MethodHandle createWindowEx;
@@ -170,6 +177,7 @@ final class WindowsRawInputHub {
             SymbolLookup kernel32 = SymbolLookup.libraryLookup("kernel32", arena);
 
             getAsyncKeyState = dc(linker, user32, "GetAsyncKeyState", FunctionDescriptor.of(JAVA_SHORT, JAVA_INT));
+            getCursorPos = dc(linker, user32, "GetCursorPos", FunctionDescriptor.of(JAVA_INT, ADDRESS));
             registerClassEx = dc(linker, user32, "RegisterClassExW", FunctionDescriptor.of(JAVA_SHORT, ADDRESS));
             createWindowEx = dc(linker, user32, "CreateWindowExW", FunctionDescriptor.of(ADDRESS,
                     JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT,
@@ -198,6 +206,7 @@ final class WindowsRawInputHub {
             rawInputBuffer = arena.allocate(RAWINPUT_BUFFER_BYTES, 8);
             touchpadDecoder = new WindowsTouchpadDecoder(arena, linker, user32);
             rawInputSize = arena.allocate(JAVA_INT);
+            cursorBuffer = arena.allocate(8);   // POINT { LONG x; LONG y; }
             keyStateBuffer = arena.allocate(256);
             uniBuffer = arena.allocate(16); // up to 8 UTF-16 units (2 bytes each) per keystroke
 
@@ -265,8 +274,8 @@ final class WindowsRawInputHub {
             }
             messageHwnd = hwnd;
 
-            // Two RAWINPUTDEVICEs (16 bytes each): mouse (for wheel/relative motion) and keyboard (for typed
-            // text). usUsagePage@0, usUsage@2, dwFlags@4, hwndTarget@8. INPUTSINK so we receive input even when
+            // Two RAWINPUTDEVICEs (16 bytes each): mouse (for wheel, relative motion and button edges) and keyboard
+            // (for typed text and key edges). usUsagePage@0, usUsage@2, dwFlags@4, hwndTarget@8. INPUTSINK so we receive input even when
             // this message-only window is not focused (routing/gating happens later, at publish time).
             MemorySegment rid = pump.allocate(32);
             rid.set(JAVA_SHORT, 0, (short) 0x01);  // generic desktop
@@ -324,8 +333,8 @@ final class WindowsRawInputHub {
     }
 
     /**
-     * Window procedure (pump thread). Accumulates raw mouse deltas and wheel notches into <em>every</em>
-     * registered sink — this pump is the process's only one, so what it receives is every window's share.
+     * Window procedure (pump thread). Accumulates raw mouse deltas, wheel notches, typed text and key and button
+     * edges into <em>every</em> registered sink — this pump is the process's only one, so what it receives is every window's share.
      */
     @SuppressWarnings({"restricted", "unused"})
     private long wndProc(MemorySegment hwnd, int msg, long wParam, long lParam) {
@@ -358,11 +367,20 @@ final class WindowsRawInputHub {
                     for (WindowsInputBackend sink : sinks) {
                         sink.acceptRawMouse(relative ? lLastX : 0, relative ? lLastY : 0, wheelX, wheelY);
                     }
+                    if ((usButtonFlags & BUTTON_FLAGS) != 0) {
+                        acceptButtons(usButtonFlags);
+                    }
                 } else if (dwType == RIM_TYPEKEYBOARD) {
                     // RAWKEYBOARD begins at offset 24: MakeCode@24, Flags@26, Reserved@28, VKey@30, Message@32.
+                    int makeCode = rawInputBuffer.get(JAVA_SHORT, 24) & 0xFFFF;
                     int flags = rawInputBuffer.get(JAVA_SHORT, 26) & 0xFFFF;
                     int vKey = rawInputBuffer.get(JAVA_SHORT, 30) & 0xFFFF;
-                    if ((flags & RI_KEY_BREAK) == 0) { // key-down only
+                    boolean down = (flags & RI_KEY_BREAK) == 0;
+                    long now = System.nanoTime();
+                    for (WindowsInputBackend sink : sinks) {
+                        sink.acceptRawKey(vKey, makeCode, (flags & RI_KEY_E0) != 0, down, now);
+                    }
+                    if (down) {
                         translateToChars(vKey);
                     }
                 } else if (dwType == RIM_TYPEHID) {
@@ -385,6 +403,43 @@ final class WindowsRawInputHub {
         } catch (Throwable t) {
             // Never let an exception cross the native boundary.
             return 0L;
+        }
+    }
+
+    /** Every button's down and up flag in {@code RAWMOUSE.usButtonFlags}. */
+    private static final int BUTTON_FLAGS = 0x003F;
+
+    /**
+     * Fan the button presses and releases in one raw-mouse report into every sink, with where the cursor is (pump
+     * thread). The cursor is read here once, not by each sink, and read now: the pump sees the report as it arrives,
+     * and that is the nearest anything gets to where the pointer was when the button moved. A report that has both
+     * a button's down and its up is a click, so the down goes first.
+     */
+    @SuppressWarnings("restricted")
+    private void acceptButtons(int usButtonFlags) throws Throwable {
+        long now = System.nanoTime();
+        int x = 0;
+        int y = 0;
+        if ((int) getCursorPos.invokeExact(cursorBuffer) != 0) {
+            x = cursorBuffer.get(JAVA_INT, 0);
+            y = cursorBuffer.get(JAVA_INT, 4);
+        }
+        fanButton(MouseButton.LEFT, usButtonFlags, RI_MOUSE_LEFT_BUTTON_DOWN, x, y, now);
+        fanButton(MouseButton.RIGHT, usButtonFlags, RI_MOUSE_RIGHT_BUTTON_DOWN, x, y, now);
+        fanButton(MouseButton.MIDDLE, usButtonFlags, RI_MOUSE_MIDDLE_BUTTON_DOWN, x, y, now);
+    }
+
+    /** One button's down and up, if the report has them, into every sink. */
+    private void fanButton(MouseButton button, int usButtonFlags, int downFlag, int x, int y, long now) {
+        if ((usButtonFlags & downFlag) != 0) {
+            for (WindowsInputBackend sink : sinks) {
+                sink.acceptButton(button, true, x, y, now);
+            }
+        }
+        if ((usButtonFlags & (downFlag << 1)) != 0) {
+            for (WindowsInputBackend sink : sinks) {
+                sink.acceptButton(button, false, x, y, now);
+            }
         }
     }
 

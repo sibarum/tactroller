@@ -218,7 +218,7 @@ try (Tactroller t = Tactroller.open()) {
 | Window-relative coords | `attach()`, `setCoordinateSpace(CLIENT)` | `ScreenToClient` |
 | HiDPI / framebuffer coords | `contentScale()`, `setCoordinateSpace(FRAMEBUFFER)` | `GetDpiForWindow` |
 | Focus gating | `setFocusGated(true)`, `InputEvent.FocusChanged` | `GetForegroundWindow` |
-| Per-frame edges | `snapshot()` → `InputFrame` | shared (diffed in the API layer) |
+| Per-frame edges | `snapshot()` → `InputFrame.edges()` | RawInput key and button reports, queued; settled against polled state in the API layer |
 | Modifiers | `modifiers()`, `InputFrame.hasModifier` | derived from held keys |
 
 **Thread affinity:** the Windows backend runs its own RawInput message-only window on its own pump
@@ -246,7 +246,7 @@ are routed:
 | Channel | OS scope (Windows) | Where the code lives | Routing |
 |---|---|---|---|
 | Pointer position, buttons, key state | global (`GetCursorPos`, `GetAsyncKeyState` — polled) | per-window backend | positional / focal per event kind |
-| Wheel, raw relative motion, typed text | **per-process** (RawInput: last registration wins) | `WindowsRawInputHub`, fanned to every backend | positional (wheel/motion), focal (text) |
+| Wheel, raw relative motion, typed text, key and button edges | **per-process** (RawInput: last registration wins) | `WindowsRawInputHub`, fanned to every backend | positional (wheel/motion/buttons), focal (text/keys) |
 | Touchpad contacts | **per-process** (RawInput HID) | `WindowsRawInputHub` + `WindowsTouchpadDecoder`, fanned | positional, held by the touch until the surface clears |
 | Focus (`GetForegroundWindow`) | per-window | per-window backend | always published |
 | Pointer target (`WindowFromPoint` + client rect) | global read, per-window answer | per-window backend | n/a — it *is* the positional gate |
@@ -275,11 +275,20 @@ the guard test's list.
 ### How events stay identical across OSes
 
 The event loop lives in `tactroller-api`, not in the platform backends. It samples the backend
-(`pollPointer` + `pollKeys`) at a fixed rate and diffs consecutive snapshots to derive press,
-release and move events. That derivation is the *same code* on Windows, macOS and Linux — the
-backends only ever report "current state", so there is no native event system to drift between
-platforms. Backends may accelerate the snapshot (X11 reads the whole keyboard in one
+(`pollPointer` + `pollKeys`) at a fixed rate and derives press, release and move events from it.
+That derivation is the *same code* on Windows, macOS and Linux, so there is no native event system
+to drift between platforms. Backends may accelerate the snapshot (X11 reads the whole keyboard in one
 `XQueryKeymap`) without changing the observable event semantics.
+
+**No click is lost between two polls.** Polled state cannot show a press and release that both fell
+between two samples, so a click quicker than a frame, and the second click of a double click, would
+vanish. A backend that sees key and button reports as they happen queues them (`drainEdges()`; Windows
+from RawInput), and `EdgeLedger` settles the queue against the poll: every queued edge that changes the
+reported state is kept, in order, with its own time and pointer position; one that does not (a press of
+what is already down, a release the poll already reported) is dropped; and whatever still differs from
+the poll gets an edge at the end. The poll stays the authority on state, so a queue that lags the OS or
+misses a report leaves nothing stuck, and a backend with no queue gets the plain diff of two polls.
+`InputFrame.edges()` carries the result; the edge sets are its summary.
 
 Add the API plus the host platform module as dependencies (or let the reactor build select them):
 
