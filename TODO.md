@@ -1,6 +1,6 @@
 # Tactroller — TODO
 
-## Queued key and button edges: try them with a real hand, then move Linux over
+## Queued key and button edges: try them with a real hand
 
 Windows now queues every key and button press and release from RawInput (`drainEdges()`), and `EdgeLedger` settles
 the queue against the poll, so a click quicker than a frame, or two of them, arrives whole. `EdgeLedgerTest` holds
@@ -11,10 +11,11 @@ numeric keypad with Num Lock off types no stray keys (the raw report's virtual k
 `GetAsyncKeyState` reports, or the ledger reads a spurious tap). `RawInputFanoutTest` could inject a click with
 `SendInput` the way it injects a wheel notch.
 
-`tactroller-linux` still does what it did before the queue: it latches the XI2 raw presses and releases, and its poll
-reports a click spread over two frames (`LinuxInputBackend.settle`). That loses the second click of a double click
-inside one frame. Its latches should become a queue that `drainEdges()` returns, and `settle` should go: the ledger
-does that job now.
+`tactroller-linux` queues the same way now, from XI2 raw presses and releases on the root window
+(`X11WindowEvents.drainEdges`), and its polls report plain live state. It has only been compiled on Windows: on an
+X11 or XWayland session, check the same things there, and that a button edge's position (asked for with
+`XQueryPointer` as the raw event is read, since a raw event carries none) lands where the click was during a fast
+drag.
 
 ## Dead keys, tried in a running application on Linux
 

@@ -283,7 +283,7 @@ to drift between platforms. Backends may accelerate the snapshot (X11 reads the 
 **No click is lost between two polls.** Polled state cannot show a press and release that both fell
 between two samples, so a click quicker than a frame, and the second click of a double click, would
 vanish. A backend that sees key and button reports as they happen queues them (`drainEdges()`; Windows
-from RawInput), and `EdgeLedger` settles the queue against the poll: every queued edge that changes the
+from RawInput, Linux from XI2 raw events while a window is attached), and `EdgeLedger` settles the queue against the poll: every queued edge that changes the
 reported state is kept, in order, with its own time and pointer position; one that does not (a press of
 what is already down, a release the poll already reported) is dropped; and whatever still differs from
 the poll gets an edge at the end. The poll stays the authority on state, so a queue that lags the OS or

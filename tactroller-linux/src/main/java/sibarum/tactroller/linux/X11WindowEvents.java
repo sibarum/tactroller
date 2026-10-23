@@ -1,6 +1,9 @@
 package sibarum.tactroller.linux;
 
 import sibarum.tactroller.api.BackendException;
+import sibarum.tactroller.api.InputEdge;
+import sibarum.tactroller.api.Key;
+import sibarum.tactroller.api.MouseButton;
 import sibarum.tactroller.api.ScrollDelta;
 
 import java.lang.foreign.Arena;
@@ -12,8 +15,9 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.SymbolLookup;
 import java.lang.foreign.ValueLayout;
 import java.lang.invoke.MethodHandle;
-import java.util.Arrays;
+import java.util.ArrayDeque;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 import static java.lang.foreign.MemoryLayout.PathElement.groupElement;
@@ -38,8 +42,9 @@ import static java.lang.foreign.ValueLayout.JAVA_SHORT;
  * <p><b>Presses between polls.</b> Buttons and keys are polled as state, once a frame, and a press and release that
  * both fall between two polls leave the state unchanged: at a low enough frame rate (a frame longer than a click)
  * every click is lost. So the presses and releases themselves are also read, as XI2 <em>raw</em> events selected on
- * the root window, which take no grab and so leave the owner's alone, and are latched here until the backend's next
- * poll drains them ({@link #drainButtonEdges}, {@link #drainKeyEdges}).
+ * the root window, which take no grab and so leave the owner's alone, and are queued here in order, as {@link
+ * InputEdge}s with the time each was read and, for a button, where the pointer was, until the backend drains them
+ * ({@link #drainEdges}). The backend's poll stays the authority on state, and the API's ledger settles the two.
  *
  * <p><b>Occlusion comes free.</b> {@code XI_Enter}/{@code XI_Leave} are sent by the server against the real stacking
  * order, so "the pointer is over this window and nothing covers it there" is exactly whether the last crossing was an
@@ -76,10 +81,15 @@ final class X11WindowEvents implements AutoCloseable {
     /** {@code XMappingEvent.request}: after type, serial, send_event, display and window. */
     private static final long MAPPING_REQUEST_OFFSET = 40;
 
-    /** The core button-mask bit (X.h {@code Button1Mask} on) for logical buttons 1 to 3; 0 for the rest. */
-    private static int buttonMask(int logical) {
-        return logical >= 1 && logical <= 3 ? 1 << (7 + logical) : 0;
-    }
+    /**
+     * Edges kept between drains. Bounded, because nothing obliges anyone to drain, and raw events arrive for the
+     * whole desktop: a backend used only for focus and the wheel would otherwise keep every keystroke. The oldest go
+     * first, and losing them is safe, because the poll still settles state; only the clicks in between are lost.
+     */
+    private static final int EDGE_QUEUE_LIMIT = 512;
+
+    /** Logical buttons 1 to 3 (X.h {@code Button1} on) as the API's; {@code null} for the wheel and side buttons. */
+    private static final MouseButton[] BUTTONS = {null, MouseButton.LEFT, MouseButton.MIDDLE, MouseButton.RIGHT};
 
     // ---- Struct layouts ---------------------------------------------------------------------------------------------
 
@@ -268,6 +278,9 @@ final class X11WindowEvents implements AutoCloseable {
     private final int[] stopPipe;
     private final Thread thread;
     private final int xiOpcode;
+    private final long root;
+    /** Keycode (index) to the keys the backend polls at it, resolved against the same server; read-only. */
+    private final Key[][] keysByKeycode;
 
     /** {@code (deviceid << 16) | valuator number} to its axis; pump thread only. */
     private final Map<Long, ScrollAxis> axes = new HashMap<>();
@@ -278,23 +291,27 @@ final class X11WindowEvents implements AutoCloseable {
     private final StringBuilder chars = new StringBuilder();
     private double scrollX;
     private double scrollY;
-    /** Core button-mask bits pressed / released since the last {@link #drainButtonEdges}. */
-    private int buttonsPressed;
-    private int buttonsReleased;
-    /** Keycode bitmaps, laid out as {@code XQueryKeymap}'s, pressed / released since the last {@link #drainKeyEdges}. */
-    private final byte[] keysPressed = new byte[32];
-    private final byte[] keysReleased = new byte[32];
+    /** Key and button edges since the last {@link #drainEdges}, oldest first. */
+    private final ArrayDeque<InputEdge> edges = new ArrayDeque<>();
 
     /** Physical button (index) to logical, as the server maps them (left-handed swaps); pump thread only. */
     private byte[] pointerMapping = new byte[0];
+    /** {@code XQueryPointer}'s out-parameters, for where a button edge happened; pump thread only. */
+    private final MemorySegment queryWindows = arena.allocate(JAVA_LONG, 2);
+    private final MemorySegment queryInts = arena.allocate(JAVA_INT, 5);
 
     private volatile boolean focused;
     private volatile boolean pointerInside;
     private volatile boolean stopping;
 
+    /**
+     * @param keysByKeycode keycode (0 to 255) to the keys polled at it, {@code null} where there are none. A raw key
+     *                      event at any other keycode is not an edge the poll could agree with, so it is not queued.
+     */
     @SuppressWarnings("restricted")
-    X11WindowEvents(long window) throws BackendException {
+    X11WindowEvents(long window, Key[][] keysByKeycode) throws BackendException {
         this.window = window;
+        this.keysByKeycode = keysByKeycode;
         try {
             this.display = (MemorySegment) XOpenDisplay.invokeExact(MemorySegment.NULL);
             if (display.equals(MemorySegment.NULL)) {
@@ -316,6 +333,7 @@ final class X11WindowEvents implements AutoCloseable {
                 throw new BackendException("XInput 2 unavailable (server offers " + major.get(JAVA_INT, 0) + "."
                         + minor.get(JAVA_INT, 0) + ")");
             }
+            this.root = (long) XDefaultRootWindow.invokeExact(display);
             select();
             readPointerMapping();
             readInitialState();
@@ -355,7 +373,6 @@ final class X11WindowEvents implements AutoCloseable {
         rawEm.set(JAVA_INT, off(XIEventMask, "deviceid"), XIAllMasterDevices);
         rawEm.set(JAVA_INT, off(XIEventMask, "mask_len"), 4);
         rawEm.set(ADDRESS, off(XIEventMask, "mask"), rawMask);
-        long root = (long) XDefaultRootWindow.invokeExact(display);
         int ignored2 = (int) XISelectEvents.invokeExact(display, root, rawEm, 1);
         int ignored3 = (int) XFlush.invokeExact(display);
     }
@@ -522,30 +539,46 @@ final class X11WindowEvents implements AutoCloseable {
         }
     }
 
-    /** {@code detail} sits at the same offset in {@code XIRawEvent} as in {@code XIDeviceEvent}. */
-    private void onRawButton(boolean press, int physical) {
+    /**
+     * A raw button press or release, as the logical button the poll reads, with where the pointer is. {@code detail}
+     * sits at the same offset in {@code XIRawEvent} as in {@code XIDeviceEvent}. A raw event carries no position, so
+     * the pointer is asked for, as soon after the event as it is read.
+     */
+    private void onRawButton(boolean press, int physical) throws Throwable {
+        long nanos = System.nanoTime();
         int logical = physical >= 1 && physical <= pointerMapping.length
                 ? pointerMapping[physical - 1] & 0xFF : physical;
-        int bit = buttonMask(logical);
-        if (bit == 0) {
+        MouseButton button = logical >= 1 && logical < BUTTONS.length ? BUTTONS[logical] : null;
+        if (button == null) {
             return;   // the wheel and side buttons
         }
-        synchronized (lock) {
-            if (press) {
-                buttonsPressed |= bit;
-            } else {
-                buttonsReleased |= bit;
-            }
+        int ignored = (int) XQueryPointer.invokeExact(display, root, queryWindows, queryWindows.asSlice(8),
+                queryInts, queryInts.asSlice(4), queryInts.asSlice(8), queryInts.asSlice(12), queryInts.asSlice(16));
+        queue(InputEdge.button(button, press, queryInts.getAtIndex(JAVA_INT, 0), queryInts.getAtIndex(JAVA_INT, 1),
+                nanos));
+    }
+
+    /**
+     * A raw key press or release, as each key the poll reads at that keycode. An auto-repeat press is queued like any
+     * other; it presses what is already down, so the ledger drops it.
+     */
+    private void onRawKey(boolean press, int keycode) {
+        long nanos = System.nanoTime();
+        Key[] keys = keycode > 0 && keycode < keysByKeycode.length ? keysByKeycode[keycode] : null;
+        if (keys == null) {
+            return;
+        }
+        for (Key key : keys) {
+            queue(InputEdge.key(key, press, nanos));
         }
     }
 
-    private void onRawKey(boolean press, int keycode) {
-        if (keycode <= 0 || keycode >= 256) {
-            return;
-        }
+    private void queue(InputEdge edge) {
         synchronized (lock) {
-            byte[] into = press ? keysPressed : keysReleased;
-            into[keycode / 8] |= (byte) (1 << (keycode % 8));
+            if (edges.size() == EDGE_QUEUE_LIMIT) {
+                edges.removeFirst();
+            }
+            edges.addLast(edge);
         }
     }
 
@@ -644,26 +677,15 @@ final class X11WindowEvents implements AutoCloseable {
         }
     }
 
-    /**
-     * The core button-mask bits pressed and released since the last call, resetting both: pressed in the low 32
-     * bits, released in the high.
-     */
-    long drainButtonEdges() {
+    /** The key and button edges since the last call, oldest first, button positions in root (screen) pixels. */
+    List<InputEdge> drainEdges() {
         synchronized (lock) {
-            long edges = Integer.toUnsignedLong(buttonsPressed) | ((long) buttonsReleased << 32);
-            buttonsPressed = 0;
-            buttonsReleased = 0;
-            return edges;
-        }
-    }
-
-    /** Copy the keycodes pressed and released since the last call into the two 32-byte bitmaps, resetting them. */
-    void drainKeyEdges(byte[] pressed, byte[] released) {
-        synchronized (lock) {
-            System.arraycopy(keysPressed, 0, pressed, 0, 32);
-            System.arraycopy(keysReleased, 0, released, 0, 32);
-            Arrays.fill(keysPressed, (byte) 0);
-            Arrays.fill(keysReleased, (byte) 0);
+            if (edges.isEmpty()) {
+                return List.of();
+            }
+            List<InputEdge> drained = List.copyOf(edges);
+            edges.clear();
+            return drained;
         }
     }
 
