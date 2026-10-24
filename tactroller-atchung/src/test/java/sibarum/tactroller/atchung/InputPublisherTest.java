@@ -2,6 +2,7 @@ package sibarum.tactroller.atchung;
 
 import org.junit.jupiter.api.Test;
 import sibarum.atchung.Atchung;
+import sibarum.probe.Cause;
 import sibarum.tactroller.api.InputEdge;
 import sibarum.tactroller.api.InputEvent;
 import sibarum.tactroller.api.InputFrame;
@@ -17,6 +18,7 @@ import java.util.List;
 import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class InputPublisherTest {
@@ -449,5 +451,46 @@ class InputPublisherTest {
         got.clear();
         pub.publish(touch(false, a));
         assertTrue(got.isEmpty(), "and once clear, the hold is over");
+    }
+
+    /**
+     * Input is where causes begin: each event in a new cause of its own, never the cause of the frame that pumped
+     * it, and a focus change one cause for everything it publishes.
+     */
+    @Test
+    void eachEventBeginsACauseOfItsOwn() {
+        Atchung bus = Atchung.create();
+        InputPublisher pub = new InputPublisher(bus);
+        List<InputEvent> got = new ArrayList<>();
+        List<Long> causes = new ArrayList<>();
+        bus.subscribe(pub.events(), e -> {
+            got.add(e);
+            causes.add(Cause.current());
+        });
+
+        long pumping = Cause.source("test.frame", Cause.Kind.TIMER).next();
+        Cause.within(pumping, () -> {
+            pub.publish(routed(Set.of(Key.A), Set.of(MouseButton.LEFT), new ScrollDelta(0, 1.0), new int[]{'a'},
+                    true, true));
+            assertEquals(pumping, Cause.current(), "the pumping thread is back in its own cause");
+        });
+
+        assertEquals(4, got.size(), got.toString());
+        assertEquals(4, Set.copyOf(causes).size(), "a key, a button, a wheel notch and a character: four causes");
+        for (long cause : causes) {
+            assertEquals(Cause.Kind.INPUT, Cause.kindOf(cause));
+            assertNotEquals(pumping, cause);
+        }
+
+        got.clear();
+        causes.clear();
+        pub.publish(frame(Set.of(Key.LEFT_SHIFT), Set.of(), Set.of(), Set.of(), Set.of(), Set.of(),
+                0, 0, ScrollDelta.ZERO, true));
+        pub.publish(frame(Set.of(Key.LEFT_SHIFT), Set.of(), Set.of(), Set.of(), Set.of(), Set.of(),
+                0, 0, ScrollDelta.ZERO, false));
+        assertTrue(got.get(0) instanceof InputEvent.KeyReleased, got.toString());
+        assertTrue(got.get(1) instanceof InputEvent.FocusChanged, got.toString());
+        assertEquals(causes.get(0), causes.get(1), "the release focus unwinds is the focus change's own doing");
+        assertEquals(Cause.NONE, Cause.current());
     }
 }

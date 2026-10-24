@@ -4,6 +4,7 @@ import sibarum.atchung.Atchung;
 import sibarum.atchung.Committer;
 import sibarum.atchung.State;
 import sibarum.atchung.Topic;
+import sibarum.probe.Cause;
 import sibarum.tactroller.api.InputEdge;
 import sibarum.tactroller.api.InputEvent;
 import sibarum.tactroller.api.InputFrame;
@@ -56,6 +57,15 @@ import java.util.Set;
  *       a passive latest-value read rather than a delivered event.</li>
  * </ul>
  *
+ * <h2>Causes</h2>
+ *
+ * <p>This is where input comes in from the outside world, so it is where input's causes begin (atchung's
+ * {@code docs/correlation.md}). Each event is published in a new cause of its own, from a source for its kind
+ * ({@code input.key}, {@code input.button}, ...), so everything a click sets off, through any number of mailboxes,
+ * carries the click's ID. A focus change is one cause for all it publishes: the releases it unwinds, the change
+ * itself and the modifiers it re-asserts are one thing that happened. Always a new cause, whatever the thread was
+ * in: the frame that pumps input is not what the user's keystroke was caused by.
+ *
  * <p>The second and third bullets are the same rule twice: <b>a gate on delivery must not desynchronize
  * state.</b> A gate decides whose window an event belongs to, and it is right about that — but a consumer's
  * belief about what is held, and a gesture already in flight, are state rather than delivery, and dropping the
@@ -70,6 +80,14 @@ public final class InputPublisher {
     private final Topic<InputEvent> events;
     private final State<PointerState> pointer;
     private final Committer<PointerState, PointerState> setPointer;
+
+    private static final Cause.Source KEY = Cause.source("input.key", Cause.Kind.INPUT);
+    private static final Cause.Source BUTTON = Cause.source("input.button", Cause.Kind.INPUT);
+    private static final Cause.Source POINTER = Cause.source("input.pointer", Cause.Kind.INPUT);
+    private static final Cause.Source SCROLL = Cause.source("input.scroll", Cause.Kind.INPUT);
+    private static final Cause.Source TEXT = Cause.source("input.text", Cause.Kind.INPUT);
+    private static final Cause.Source TOUCH = Cause.source("input.touch", Cause.Kind.INPUT);
+    private static final Cause.Source FOCUS = Cause.source("input.focus", Cause.Kind.INPUT);
 
     /** The keys that are modifiers -- the state half of the keyboard, safe to re-assert on focus gain. */
     private static final Set<Key> MODIFIER_KEYS = Set.of(
@@ -125,7 +143,7 @@ public final class InputPublisher {
         if (positional) {
             ScrollDelta scroll = f.scroll();
             if (!scroll.isZero()) {
-                bus.publish(events, new InputEvent.Scrolled(scroll.x(), scroll.y(), f.pointerX(), f.pointerY(), ts));
+                emit(SCROLL, new InputEvent.Scrolled(scroll.x(), scroll.y(), f.pointerX(), f.pointerY(), ts));
             }
         }
 
@@ -133,7 +151,7 @@ public final class InputPublisher {
         // kept strictly separate from the KeyPressed command channel above. Focal: text goes where focus is.
         if (focal) {
             for (int cp : f.typedChars()) {
-                bus.publish(events, new InputEvent.CharTyped(cp, ts));
+                emit(TEXT, new InputEvent.CharTyped(cp, ts));
             }
         }
 
@@ -151,7 +169,7 @@ public final class InputPublisher {
         // gesture and made the other half worse.
         PointerDelta motion = f.motion();
         if ((positional || !heldSincePress.isEmpty()) && !motion.isZero()) {
-            bus.publish(events, new InputEvent.PointerMoved(
+            emit(POINTER, new InputEvent.PointerMoved(
                     f.pointerX(), f.pointerY(), motion.dx(), motion.dy(), ts));
         }
 
@@ -161,45 +179,70 @@ public final class InputPublisher {
         // it (a window opening over it, say) would be left mid-flight forever, its lift never delivered.
         List<TouchpadContact> touch = f.touchpadContacts();
         if (!touch.equals(publishedTouchpad) && (positional || !publishedTouchpad.isEmpty())) {
-            bus.publish(events, new InputEvent.TouchpadChanged(touch, ts));
+            emit(TOUCH, new InputEvent.TouchpadChanged(touch, ts));
             publishedTouchpad = touch;
         }
 
         if (f.focused() != prevFocused) {
-            if (!f.focused()) {
-                // Focus is leaving: from here on the focal gate suppresses this window's key events, so the
-                // release edges for anything still held would never arrive and the consumer would keep it
-                // latched forever. A gate on *delivery* must not desynchronize *state*, so unwind now, while
-                // what is held is still known. Releases are inert -- they cannot fire a command.
-                //
-                // This is not hypothetical: opening a modal dialog with Ctrl+Shift+O and landing focus on
-                // another window left CONTROL and SHIFT latched here, and every Ctrl-only global shortcut
-                // then failed to match (a shortcut compares its modifier set exactly, while a focused
-                // widget's own chords ask "is CONTROL among them?" and kept working -- which is what made
-                // the symptom so lopsided).
-                for (Key k : heldWhileFocused) {
-                    bus.publish(events, new InputEvent.KeyReleased(k, ts));
-                }
-            }
-            bus.publish(events, new InputEvent.FocusChanged(f.focused(), ts));
-            prevFocused = f.focused();
-            if (f.focused()) {
-                // Focus is arriving: presses that happened while this window was unfocused were suppressed,
-                // so re-assert the modifiers physically held now -- otherwise a chord begun in another window
-                // ("hold Ctrl, click here, press W") sees no CONTROL. Modifiers only: a non-modifier press is
-                // a command, and replaying it would fire an action the user aimed somewhere else.
-                for (Key k : f.heldKeys()) {
-                    if (MODIFIER_KEYS.contains(k)) {
-                        bus.publish(events, new InputEvent.KeyPressed(k, ts));
-                    }
-                }
+            long previous = Cause.enter(FOCUS.next());
+            try {
+                focusChanged(f, ts);
+            } finally {
+                Cause.exit(previous);
             }
         }
         heldWhileFocused = f.focused() ? f.heldKeys() : Set.of();
 
         PointerState next = new PointerState(f.pointerX(), f.pointerY(), f.heldButtons());
         if (!pointer.value().equals(next)) {
-            pointer.commit(setPointer, next);
+            long previous = Cause.enter(POINTER.next());
+            try {
+                pointer.commit(setPointer, next);
+            } finally {
+                Cause.exit(previous);
+            }
+        }
+    }
+
+    /** Publish {@code event} in a new cause of {@code source}'s. */
+    private void emit(Cause.Source source, InputEvent event) {
+        long previous = Cause.enter(source.next());
+        try {
+            bus.publish(events, event);
+        } finally {
+            Cause.exit(previous);
+        }
+    }
+
+    /** The focus edge, all of it in one cause: see the class comment. */
+    private void focusChanged(InputFrame f, long ts) {
+        if (!f.focused()) {
+            // Focus is leaving: from here on the focal gate suppresses this window's key events, so the
+            // release edges for anything still held would never arrive and the consumer would keep it
+            // latched forever. A gate on *delivery* must not desynchronize *state*, so unwind now, while
+            // what is held is still known. Releases are inert -- they cannot fire a command.
+            //
+            // This is not hypothetical: opening a modal dialog with Ctrl+Shift+O and landing focus on
+            // another window left CONTROL and SHIFT latched here, and every Ctrl-only global shortcut
+            // then failed to match (a shortcut compares its modifier set exactly, while a focused
+            // widget's own chords ask "is CONTROL among them?" and kept working -- which is what made
+            // the symptom so lopsided).
+            for (Key k : heldWhileFocused) {
+                bus.publish(events, new InputEvent.KeyReleased(k, ts));
+            }
+        }
+        bus.publish(events, new InputEvent.FocusChanged(f.focused(), ts));
+        prevFocused = f.focused();
+        if (f.focused()) {
+            // Focus is arriving: presses that happened while this window was unfocused were suppressed,
+            // so re-assert the modifiers physically held now -- otherwise a chord begun in another window
+            // ("hold Ctrl, click here, press W") sees no CONTROL. Modifiers only: a non-modifier press is
+            // a command, and replaying it would fire an action the user aimed somewhere else.
+            for (Key k : f.heldKeys()) {
+                if (MODIFIER_KEYS.contains(k)) {
+                    bus.publish(events, new InputEvent.KeyPressed(k, ts));
+                }
+            }
         }
     }
 
@@ -211,14 +254,14 @@ public final class InputPublisher {
         @Override
         public void keyPressed(Key key, long timestampNanos) {
             if (focal) {
-                bus.publish(events, new InputEvent.KeyPressed(key, timestampNanos));
+                emit(KEY, new InputEvent.KeyPressed(key, timestampNanos));
             }
         }
 
         @Override
         public void keyReleased(Key key, long timestampNanos) {
             if (focal) {
-                bus.publish(events, new InputEvent.KeyReleased(key, timestampNanos));
+                emit(KEY, new InputEvent.KeyReleased(key, timestampNanos));
             }
         }
 
@@ -230,7 +273,7 @@ public final class InputPublisher {
         @Override
         public void buttonPressed(MouseButton button, int x, int y, long timestampNanos) {
             if (positional) {
-                bus.publish(events, new InputEvent.ButtonPressed(button, x, y, timestampNanos));
+                emit(BUTTON, new InputEvent.ButtonPressed(button, x, y, timestampNanos));
                 heldSincePress.add(button);
             }
         }
@@ -251,7 +294,7 @@ public final class InputPublisher {
         @Override
         public void buttonReleased(MouseButton button, int x, int y, long timestampNanos) {
             if (heldSincePress.remove(button)) {
-                bus.publish(events, new InputEvent.ButtonReleased(button, x, y, timestampNanos));
+                emit(BUTTON, new InputEvent.ButtonReleased(button, x, y, timestampNanos));
             }
         }
     }
