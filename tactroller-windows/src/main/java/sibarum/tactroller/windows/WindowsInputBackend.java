@@ -252,10 +252,16 @@ public final class WindowsInputBackend implements InputBackend {
      * Shift and in the extended flag for Control and Alt. Anything else not in the key map (the {@code 0xFF} that
      * prefixes escaped sequences, keys {@link Key} has no name for) is not an edge the poll could agree with, so it
      * is not queued.
+     *
+     * <p><b>A press is queued only while this window is in the foreground.</b> The keyboard is INPUTSINK, so this
+     * hears every keystroke on the desktop, and the focal gate further up asks about focus when the queue is drained,
+     * not when the key went down. An application that parks in the background drains nothing until it is looked at
+     * again, so that first frame replayed every chord typed into other programs meanwhile: Ctrl+W in a browser closed
+     * a tab here. A release is always queued; it can only end a press this window was shown.
      */
     void acceptRawKey(int vKey, int makeCode, boolean extended, boolean down, long nanos) {
         Key key = keyByVk.get(sided(vKey, makeCode, extended));
-        if (key != null) {
+        if (key != null && (!down || isFocused())) {
             queueEdge(InputEdge.key(key, down, nanos));
         }
     }
