@@ -58,6 +58,11 @@ final class WindowsRawInputHub {
     private static final long HWND_MESSAGE = -3L;
     private static final int RID_INPUT = 0x10000003;
     private static final int RIDEV_INPUTSINK = 0x00000100;
+    private static final int RIDEV_REMOVE = 0x00000001;
+    /** {@code WM_APP + 1}, posted to the pump thread: look again at what to register for ({@link #reconsider}). */
+    private static final int WM_APP_RECONSIDER = 0x8001;
+    private static final int EVENT_SYSTEM_FOREGROUND = 0x0003;
+    private static final int WINEVENT_OUTOFCONTEXT = 0x0000;
     private static final int RAWINPUTHEADER_SIZE = 24;
     private static final int RIM_TYPEMOUSE = 0;
     private static final int RIM_TYPEKEYBOARD = 1;
@@ -99,6 +104,7 @@ final class WindowsRawInputHub {
             }
             if (!instance.sinks.contains(sink)) {
                 instance.sinks.add(sink);
+                instance.postReconsider();
             }
         }
     }
@@ -110,6 +116,7 @@ final class WindowsRawInputHub {
                 return;
             }
             instance.sinks.remove(sink);
+            instance.postReconsider();
             if (instance.sinks.isEmpty()) {
                 instance.dispose();
                 instance = null;
@@ -158,6 +165,14 @@ final class WindowsRawInputHub {
     private final MethodHandle getKeyboardLayout;
     private final MethodHandle getKeyState;
     private final MethodHandle toUnicodeEx;
+    private final MethodHandle getForegroundWindow;
+    private final MethodHandle setWinEventHook;
+    private final MethodHandle unhookWinEvent;
+    private final MemorySegment ridBuffer;        // one RAWINPUTDEVICE (pump thread only)
+    /** What raw input is registered for now (pump thread only): see {@link #reconsiderNow}. */
+    private boolean mouseOn;
+    private boolean keyboardOn;
+    private MemorySegment foregroundHook = MemorySegment.NULL;
 
     private final WindowsTouchpadDecoder touchpadDecoder;
     /** Whether the touchpad usage was registered; a system that refuses it still gets wheel, motion and text. */
@@ -209,6 +224,11 @@ final class WindowsRawInputHub {
             cursorBuffer = arena.allocate(8);   // POINT { LONG x; LONG y; }
             keyStateBuffer = arena.allocate(256);
             uniBuffer = arena.allocate(16); // up to 8 UTF-16 units (2 bytes each) per keystroke
+            ridBuffer = arena.allocate(16, 8);
+            getForegroundWindow = dc(linker, user32, "GetForegroundWindow", FunctionDescriptor.of(ADDRESS));
+            setWinEventHook = dc(linker, user32, "SetWinEventHook", FunctionDescriptor.of(ADDRESS,
+                    JAVA_INT, JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, JAVA_INT, JAVA_INT));
+            unhookWinEvent = dc(linker, user32, "UnhookWinEvent", FunctionDescriptor.of(JAVA_INT, ADDRESS));
 
             startPumpThread(linker);
         } catch (BackendException e) {
@@ -274,32 +294,29 @@ final class WindowsRawInputHub {
             }
             messageHwnd = hwnd;
 
-            // Two RAWINPUTDEVICEs (16 bytes each): mouse (for wheel, relative motion and button edges) and keyboard
-            // (for typed text and key edges). usUsagePage@0, usUsage@2, dwFlags@4, hwndTarget@8. INPUTSINK so we receive input even when
-            // this message-only window is not focused (routing/gating happens later, at publish time).
-            MemorySegment rid = pump.allocate(32);
-            rid.set(JAVA_SHORT, 0, (short) 0x01);  // generic desktop
-            rid.set(JAVA_SHORT, 2, (short) 0x02);  // mouse
-            rid.set(JAVA_INT, 4, RIDEV_INPUTSINK);
-            rid.set(ADDRESS, 8, hwnd);
-            rid.set(JAVA_SHORT, 16, (short) 0x01); // generic desktop
-            rid.set(JAVA_SHORT, 18, (short) 0x06); // keyboard
-            rid.set(JAVA_INT, 20, RIDEV_INPUTSINK);
-            rid.set(ADDRESS, 24, hwnd);
-            int ok = (int) registerRawInputDevices.invokeExact(rid, 2, 16);
-            if (ok == 0) {
+            // Mouse (wheel, relative motion and button edges) and keyboard (typed text and key edges), INPUTSINK so this
+            // message-only window, which is never in front, receives them at all; routing and gating happen later, at
+            // publish time. Registered at first so a backend with no window yet hears what it always did, then narrowed
+            // by reconsider() once there is something to ask.
+            if (!setUsage(0x01, 0x02, true) || !setUsage(0x01, 0x06, true)) {
                 throw new IllegalStateException("RegisterRawInputDevices failed");
             }
-
+            mouseOn = true;
+            keyboardOn = true;
             // Precision touchpads: Digitizer / Touch Pad, delivered as RIM_TYPEHID reports of raw finger contacts.
             // Registered on its own so that a system refusing it loses only the touchpad. Registering does not take
             // the touchpad over: the OS goes on turning it into pointer motion, scrolling and system gestures.
-            MemorySegment touchpad = pump.allocate(16);
-            touchpad.set(JAVA_SHORT, 0, (short) 0x0D); // digitizer
-            touchpad.set(JAVA_SHORT, 2, (short) 0x05); // touch pad
-            touchpad.set(JAVA_INT, 4, RIDEV_INPUTSINK);
-            touchpad.set(ADDRESS, 8, hwnd);
-            touchpadRegistered = (int) registerRawInputDevices.invokeExact(touchpad, 1, 16) != 0;
+            touchpadRegistered = setUsage(0x0D, 0x05, true);
+
+            // Told on this thread, while it waits for messages, whenever another window comes to the front.
+            MethodHandle onForeground = MethodHandles.lookup().findVirtual(WindowsRawInputHub.class, "onForeground",
+                    MethodType.methodType(void.class, MemorySegment.class, int.class, MemorySegment.class, int.class,
+                            int.class, int.class, int.class)).bindTo(this);
+            MemorySegment hookStub = Linker.nativeLinker().upcallStub(onForeground, FunctionDescriptor.ofVoid(
+                    ADDRESS, JAVA_INT, ADDRESS, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT), arena);
+            foregroundHook = (MemorySegment) setWinEventHook.invokeExact(EVENT_SYSTEM_FOREGROUND,
+                    EVENT_SYSTEM_FOREGROUND, MemorySegment.NULL, hookStub, 0, 0, WINEVENT_OUTOFCONTEXT);
+            reconsiderNow();
         } catch (Throwable t) {
             pumpInitError = t;
             ready.countDown();
@@ -315,6 +332,11 @@ final class WindowsRawInputHub {
                 if (r == -1) {
                     break;
                 }
+                // MSG: hwnd@0, message@8. A thread message has no window to dispatch to.
+                if (msg.get(JAVA_INT, 8) == WM_APP_RECONSIDER && msg.get(ADDRESS, 0).equals(MemorySegment.NULL)) {
+                    reconsiderNow();
+                    continue;
+                }
                 int ignoredT = (int) translateMessage.invokeExact(msg);
                 long ignoredD = (long) dispatchMessage.invokeExact(msg);
             }
@@ -322,6 +344,10 @@ final class WindowsRawInputHub {
             pumpInitError = t;
         } finally {
             try {
+                if (!foregroundHook.equals(MemorySegment.NULL)) {
+                    int ignored = (int) unhookWinEvent.invokeExact(foregroundHook);
+                    foregroundHook = MemorySegment.NULL;
+                }
                 if (!messageHwnd.equals(MemorySegment.NULL)) {
                     int ignored = (int) destroyWindow.invokeExact(messageHwnd);
                     messageHwnd = MemorySegment.NULL;
@@ -330,6 +356,92 @@ final class WindowsRawInputHub {
                 // best effort
             }
         }
+    }
+
+    /**
+     * Ask the pump to look again at what it should be registered for (any thread): a sink came or went, or a window was
+     * attached or detached. Nothing when no hub is up.
+     */
+    static void reconsider() {
+        synchronized (LOCK) {
+            if (instance != null) {
+                instance.postReconsider();
+            }
+        }
+    }
+
+    @SuppressWarnings("restricted")
+    private void postReconsider() {
+        int tid = pumpThreadId;
+        if (tid != 0) {
+            try {
+                int ignored = (int) postThreadMessage.invokeExact(tid, WM_APP_RECONSIDER, 0L, 0L);
+            } catch (Throwable ignored) {
+                // the next foreground change looks again
+            }
+        }
+    }
+
+    /** {@code EVENT_SYSTEM_FOREGROUND}, on the pump thread: another window is in front, so the keyboard may change hands. */
+    @SuppressWarnings("unused")
+    private void onForeground(MemorySegment hook, int event, MemorySegment hwnd, int idObject, int idChild,
+                              int eventThread, int millis) {
+        try {
+            reconsiderNow();
+        } catch (Throwable t) {
+            // Never let an exception cross the native boundary.
+        }
+    }
+
+    /**
+     * Register for what the sinks can use and no more (pump thread). Raw input is delivered for the whole desktop, so
+     * each report costs this process a wake and a read whether or not it was meant for it: every mouse move, and every
+     * keystroke typed into another program.
+     *
+     * <ul>
+     *   <li><b>Nothing at all while no sink is reachable</b> ({@link WindowsInputBackend#reachable}): a background run's
+     *       windows hear no real device, so the person's mouse and keyboard cost that run nothing.</li>
+     *   <li><b>The keyboard only while a key would be for one of the sinks</b>: a reachable window is in front. A
+     *       press is queued only then anyway ({@link WindowsInputBackend#acceptRawKey}); a release that comes after the
+     *       window lost the front is not heard, and the poll, which reads the key's state, settles it.</li>
+     *   <li><b>The mouse whenever a sink is reachable, in front or not.</b> The click that brings a window to the
+     *       front is generated before the window is in front, and so is the wheel over a window the pointer only hovers
+     *       (Windows scrolls inactive windows by default): both arrive through raw input, and would be lost.</li>
+     * </ul>
+     */
+    @SuppressWarnings("restricted")
+    private void reconsiderNow() throws Throwable {
+        long foreground = ((MemorySegment) getForegroundWindow.invokeExact()).address();
+        boolean mouse = false;
+        boolean keyboard = false;
+        for (WindowsInputBackend sink : sinks) {
+            mouse |= sink.reachable();
+            keyboard |= sink.keyboardFor(foreground);
+        }
+        if (mouse != mouseOn) {
+            setUsage(0x01, 0x02, mouse);
+            if (touchpadRegistered) {
+                setUsage(0x0D, 0x05, mouse);
+            }
+            mouseOn = mouse;
+        }
+        if (keyboard != keyboardOn) {
+            setUsage(0x01, 0x06, keyboard);
+            keyboardOn = keyboard;
+        }
+    }
+
+    /**
+     * Register one usage to the message-only window, INPUTSINK, or remove it (pump thread). RAWINPUTDEVICE:
+     * usUsagePage@0, usUsage@2, dwFlags@4, hwndTarget@8; a removal names no window.
+     */
+    @SuppressWarnings("restricted")
+    private boolean setUsage(int page, int usage, boolean on) throws Throwable {
+        ridBuffer.set(JAVA_SHORT, 0, (short) page);
+        ridBuffer.set(JAVA_SHORT, 2, (short) usage);
+        ridBuffer.set(JAVA_INT, 4, on ? RIDEV_INPUTSINK : RIDEV_REMOVE);
+        ridBuffer.set(ADDRESS, 8, on ? messageHwnd : MemorySegment.NULL);
+        return (int) registerRawInputDevices.invokeExact(ridBuffer, 1, 16) != 0;
     }
 
     /**

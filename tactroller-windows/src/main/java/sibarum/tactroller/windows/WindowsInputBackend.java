@@ -253,8 +253,9 @@ public final class WindowsInputBackend implements InputBackend {
      * prefixes escaped sequences, keys {@link Key} has no name for) is not an edge the poll could agree with, so it
      * is not queued.
      *
-     * <p><b>A press is queued only while this window is in the foreground.</b> The keyboard is INPUTSINK, so this
-     * hears every keystroke on the desktop, and the focal gate further up asks about focus when the queue is drained,
+     * <p><b>A press is queued only while this window is in the foreground.</b> The keyboard is INPUTSINK, so while any
+     * of the process's windows is in front this hears every keystroke on the desktop (the hub drops the keyboard when
+     * none is: {@link WindowsRawInputHub#reconsiderNow}), and the focal gate further up asks about focus when the queue is drained,
      * not when the key went down. An application that parks in the background drains nothing until it is looked at
      * again, so that first frame replayed every chord typed into other programs meanwhile: Ctrl+W in a browser closed
      * a tab here. A release is always queued; it can only end a press this window was shown.
@@ -558,12 +559,33 @@ public final class WindowsInputBackend implements InputBackend {
         }
         attachedHwnd = window.handle();
         unattended = cloakedByItsApplication(window.handle());
+        WindowsRawInputHub.reconsider();   // a window nobody can reach may be the last reason to listen
     }
 
     @Override
     public void detach() {
         attachedHwnd = 0L;
         unattended = false;
+        WindowsRawInputHub.reconsider();
+    }
+
+    /**
+     * Whether anyone at the desk could reach this backend's window, so the real devices have something to say to it
+     * (hub's pump thread). Not {@link #unattended}; and true before a window is attached, as a backend that reads the
+     * devices with no window always could.
+     */
+    boolean reachable() {
+        return !unattended;
+    }
+
+    /**
+     * Whether a keystroke now would be for this backend's window: reachable, and in the foreground, or with no window
+     * to be in front of (hub's pump thread). {@link #isFocused} also says true for an unreachable window, for the
+     * picture it draws; the hub asks this instead, since that window hears no real keyboard.
+     */
+    boolean keyboardFor(long foreground) {
+        long hwnd = attachedHwnd;
+        return !unattended && (hwnd == 0L || hwnd == foreground);
     }
 
     /** {@code DWMWA_CLOAKED} has {@code DWM_CLOAKED_APP}: see {@link #unattended}. */

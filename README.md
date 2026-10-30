@@ -233,6 +233,15 @@ the shared event loop drains — so events still come from one place (see below)
 expose the identical API and inherit safe defaults (no scroll, lock unsupported) until their native
 plumbing lands. Text/character + IME events are not yet implemented.
 
+**What the hub listens to is only what some window can use.** RawInput is registered `INPUTSINK` (a message-only
+window is never in front), so Windows delivers every mouse move and keystroke on the desktop to the process, and each
+one costs a wake and a read whether it was meant for it or not. So the hub narrows the registration as windows attach,
+detach and come to the front: **nothing** while every attached window is one its application cloaked (a VexelRay
+background run, which hears no real device anyway); the **keyboard** only while one of its windows is in the foreground
+(a press is only ever queued then); and the **mouse** whenever a reachable window exists, in front or not, because the
+click that activates a window and the wheel over a window the pointer only hovers both arrive before it is in front.
+A backend with no window hears both, as before. `RawInputRegistrationTest` reads the registration back from Windows.
+
 ### Channel scope: the one rule to read before adding an input channel
 
 `InputBackend` is a **per-window** abstraction: one instance per window, attached with `attach(NativeWindow)`.
