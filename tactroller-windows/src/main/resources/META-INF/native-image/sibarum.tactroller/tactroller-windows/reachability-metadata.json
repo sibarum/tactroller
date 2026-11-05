@@ -4,7 +4,8 @@
     {
       "type": "sibarum.tactroller.windows.WindowsRawInputHub",
       "methods": [
-        { "name": "wndProc", "parameterTypes": ["java.lang.foreign.MemorySegment", "int", "long", "long"] }
+        { "name": "wndProc", "parameterTypes": ["java.lang.foreign.MemorySegment", "int", "long", "long"] },
+        { "name": "onForeground", "parameterTypes": ["java.lang.foreign.MemorySegment", "int", "java.lang.foreign.MemorySegment", "int", "int", "int", "int"] }
       ]
     }
   ],
@@ -13,7 +14,8 @@
   ],
   "foreign": {
     "upcalls": [
-      { "returnType": "jlong", "parameterTypes": ["void*", "jint", "jlong", "jlong"] }
+      { "returnType": "jlong", "parameterTypes": ["void*", "jint", "jlong", "jlong"] },
+      { "returnType": "void", "parameterTypes": ["void*", "jint", "void*", "jint", "jint", "jint", "jint"] }
     ],
     "downcalls": [
         { "returnType": "jint", "parameterTypes": ["void*"] },
@@ -38,7 +40,9 @@
         { "returnType": "jint", "parameterTypes": ["void*", "jint", "void*", "void*"] },
         { "returnType": "jint", "parameterTypes": ["jint", "void*", "void*", "void*"] },
         { "returnType": "jint", "parameterTypes": ["jint", "jshort", "jshort", "jshort", "void*", "void*", "void*", "jint"] },
-        { "returnType": "jint", "parameterTypes": ["jint", "jshort", "jshort", "void*", "void*", "void*", "void*", "jint"] }
+        { "returnType": "jint", "parameterTypes": ["jint", "jshort", "jshort", "void*", "void*", "void*", "void*", "jint"] },
+        { "returnType": "void*", "parameterTypes": ["jint", "jint", "void*", "void*", "jint", "jint", "jint"] },
+        { "returnType": "jint", "parameterTypes": ["void*", "jint", "void*", "jint"] }
       ]
   }
 }
