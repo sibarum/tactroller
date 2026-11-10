@@ -173,6 +173,49 @@ class InputPublisherTest {
                 "a drag that leaves the window must keep being a drag");
     }
 
+    /** A frame over a resize grip the window draws: over the window, but a press there is the window manager's. */
+    private static InputFrame overGrip(Set<MouseButton> heldBtn, Set<MouseButton> pressedBtn,
+                                       Set<MouseButton> releasedBtn, PointerDelta motion, ScrollDelta scroll) {
+        List<InputEdge> edges = new ArrayList<>();
+        for (MouseButton b : pressedBtn) {
+            edges.add(InputEdge.button(b, true, 5, 6, 1L));
+        }
+        for (MouseButton b : releasedBtn) {
+            edges.add(InputEdge.button(b, false, 5, 6, 1L));
+        }
+        return new InputFrame(Set.of(), Set.of(), Set.of(), heldBtn, pressedBtn, releasedBtn,
+                Set.of(), 5, 6, motion, scroll, true, 1L, new int[0], true, List.of(), edges, false);
+    }
+
+    /**
+     * Over a resize grip the window draws, the grip has to see the pointer (or it cannot light up under it), and must
+     * not see the press (or the press that starts the window manager's resize is also a click on the grip, and the
+     * resize a drag across it). So motion and the wheel are delivered, and the press is not.
+     */
+    @Test
+    void overAGripThePointerMovesForTheWindowButThePressIsTheWindowManagers() {
+        Atchung bus = Atchung.create();
+        InputPublisher pub = new InputPublisher(bus);
+        List<InputEvent> got = new ArrayList<>();
+        bus.subscribe(pub.events(), got::add);
+
+        pub.publish(overGrip(Set.of(), Set.of(), Set.of(), new PointerDelta(3, 0), new ScrollDelta(0, 1)));
+        assertTrue(got.stream().anyMatch(e -> e instanceof InputEvent.PointerMoved), "hover reaches the grip");
+        assertTrue(got.stream().anyMatch(e -> e instanceof InputEvent.Scrolled), "and so does the wheel");
+
+        got.clear();
+        pub.publish(overGrip(Set.of(MouseButton.LEFT), Set.of(MouseButton.LEFT), Set.of(), PointerDelta.ZERO,
+                new ScrollDelta(0, 0)));
+        assertTrue(got.stream().noneMatch(e -> e instanceof InputEvent.ButtonPressed),
+                "the press starts the resize and nothing else");
+
+        // The resize ends wherever the pointer was let go, over content or not: no release for a press never delivered.
+        got.clear();
+        pub.publish(buttons(Set.of(), Set.of(), Set.of(MouseButton.LEFT), true));
+        assertTrue(got.stream().noneMatch(e -> e instanceof InputEvent.ButtonReleased),
+                "a release is not invented for the press the window manager took");
+    }
+
     /** With no button held it is just a pointer over somebody else's window, and stays gated. */
     @Test
     void motionOutsideWithNoButtonHeldIsStillGated() {

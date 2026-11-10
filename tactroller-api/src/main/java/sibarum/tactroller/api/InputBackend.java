@@ -154,6 +154,19 @@ public interface InputBackend extends AutoCloseable {
     }
 
     /**
+     * The whole positional answer, of which {@link #isPointerTarget()} is the press half: whether the pointer is over
+     * another window, over this window's content, or over a part of this window the window manager owns (a resize band
+     * or a drawn resize grip), where the window still sees the pointer move but a press is not its.
+     *
+     * <p>{@link Tactroller#snapshot()} asks this once a frame. The default reads {@link #isPointerTarget()}, so a backend
+     * that cannot tell the window manager's parts apart reports content wherever it reports the pointer; a backend that
+     * can overrides this, and answers {@code isPointerTarget()} as {@code pointerTarget().presses()}.
+     */
+    default PointerTarget pointerTarget() {
+        return PointerTarget.of(isPointerTarget());
+    }
+
+    /**
      * Convert a screen-space point to the attached window's client area (OS logical pixels).
      *
      * @return the converted point as {@code [clientX, clientY]}; identity if no window is attached

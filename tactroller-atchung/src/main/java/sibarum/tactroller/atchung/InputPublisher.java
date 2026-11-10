@@ -46,7 +46,10 @@ import java.util.Set;
  *       window: gated on {@link InputFrame#focused()}.</li>
  *   <li><b>Positional</b> channels (wheel, button presses, pointer motion) belong to the window under the
  *       cursor: gated on {@link InputFrame#pointerTarget()}. Exactly one window passes that gate, occlusion
- *       included — a consumer cannot resolve an overlap, because its hit-testing sees only its own tree.</li>
+ *       included — a consumer cannot resolve an overlap, because its hit-testing sees only its own tree.
+ *       A <b>press</b> is gated harder, on {@link InputFrame#pressTarget()}: over a part of the window the window
+ *       manager owns (a resize grip the window draws), the pointer moves and the wheel turns for the window, so the
+ *       grip sees hover, but the press is the window manager's, so it starts the resize and nothing else.</li>
  *   <li><b>Held by the gesture:</b> once a window's press has been delivered, that window owns the gesture
  *       until it ends, so the pointer <em>motion</em> and the eventual <em>release</em> go to it wherever the
  *       pointer has wandered — this is pointer capture, and without it a drag freezes and then lurches the
@@ -135,7 +138,9 @@ public final class InputPublisher {
         // Key and button edges, one at a time and in the order they happened, so that a click that began and ended
         // inside the frame is a press then a release, and a double click is two of each, not one or none.
         edgeGates.focal = focal;
-        edgeGates.positional = positional;
+        // Presses only where the press is the window's: not over another window, and not over a resize grip, whose
+        // press the window manager takes to start a resize.
+        edgeGates.positional = f.pressTarget();
         for (InputEdge e : f.edges()) {
             e.to(edgeGates);
         }

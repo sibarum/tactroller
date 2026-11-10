@@ -31,6 +31,11 @@ import java.util.Set;
  * ({@link #pressedKeys()}, {@link #releasedButtons()}, ...) summarise them: everything with at least one press, or one
  * release, among the edges. So a quick click has its button in both {@code pressedButtons} and {@code releasedButtons}
  * and not in {@code heldButtons}; only the list says which came first, and how many times.
+ *
+ * <p>{@link #pointerTarget()} says the pointer is over this window, unoccluded, so its position, motion and wheel are
+ * this window's. {@link #pressTarget()} says a press there is this window's too, which it is not over a part the window
+ * manager owns, such as a resize grip the window draws ({@link PointerTarget#WINDOW_MANAGER}). The second implies the
+ * first.
  */
 public record InputFrame(
         Set<Key> heldKeys,
@@ -49,9 +54,12 @@ public record InputFrame(
         int[] typedChars,
         boolean pointerTarget,
         List<TouchpadContact> touchpadContacts,
-        List<InputEdge> edges) {
+        List<InputEdge> edges,
+        boolean pressTarget) {
 
     public InputFrame {
+        // A press can only be this window's where the pointer is.
+        pressTarget = pressTarget && pointerTarget;
         edges = List.copyOf(edges);
         touchpadContacts = List.copyOf(touchpadContacts);
         heldKeys = Set.copyOf(heldKeys);
@@ -155,6 +163,38 @@ public record InputFrame(
         this(heldKeys, pressedKeys, releasedKeys, heldButtons, pressedButtons, releasedButtons, modifiers,
                 pointerX, pointerY, motion, scroll, focused, timestampNanos, typedChars, pointerTarget, touchpadContacts,
                 edgesOf(pressedKeys, releasedKeys, pressedButtons, releasedButtons, pointerX, pointerY, timestampNanos));
+    }
+
+    /**
+     * Backward-compatible constructor predating {@link PointerTarget#WINDOW_MANAGER}: a press is this window's wherever
+     * the pointer is, which is what every frame said before a window's resize grips could be hovered.
+     */
+    public InputFrame(
+            Set<Key> heldKeys,
+            Set<Key> pressedKeys,
+            Set<Key> releasedKeys,
+            Set<MouseButton> heldButtons,
+            Set<MouseButton> pressedButtons,
+            Set<MouseButton> releasedButtons,
+            Set<Modifier> modifiers,
+            int pointerX,
+            int pointerY,
+            PointerDelta motion,
+            ScrollDelta scroll,
+            boolean focused,
+            long timestampNanos,
+            int[] typedChars,
+            boolean pointerTarget,
+            List<TouchpadContact> touchpadContacts,
+            List<InputEdge> edges) {
+        this(heldKeys, pressedKeys, releasedKeys, heldButtons, pressedButtons, releasedButtons, modifiers,
+                pointerX, pointerY, motion, scroll, focused, timestampNanos, typedChars, pointerTarget, touchpadContacts,
+                edges, pointerTarget);
+    }
+
+    /** {@link #pointerTarget()} and {@link #pressTarget()} as the one answer the backend gave. */
+    public PointerTarget target() {
+        return pressTarget ? PointerTarget.CONTENT : pointerTarget ? PointerTarget.WINDOW_MANAGER : PointerTarget.ELSEWHERE;
     }
 
     private static List<InputEdge> edgesOf(Set<Key> pressedKeys, Set<Key> releasedKeys,

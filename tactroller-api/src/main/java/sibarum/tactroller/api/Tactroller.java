@@ -226,7 +226,7 @@ public final class Tactroller implements AutoCloseable {
     /** The body of {@link #snapshot()}, split out so the probe span wraps all of it. */
     private InputFrame takeSnapshot() throws BackendException {
         boolean focused = backend.isFocused();
-        boolean pointerTarget = backend.isPointerTarget();
+        PointerTarget target = backend.pointerTarget();
         ScrollDelta scroll = backend.drainScroll();
         int[] chars = backend.drainChars();
         // Drained before the poll, so every queued edge happened before the state read below: the poll can be
@@ -257,7 +257,7 @@ public final class Tactroller implements AutoCloseable {
                 keys, sets.pressedKeys, sets.releasedKeys,
                 buttons, sets.pressedButtons, sets.releasedButtons,
                 Modifier.from(keys),
-                xy[0], xy[1], motion, scroll, focused, now, chars, pointerTarget, touchpad, edges);
+                xy[0], xy[1], motion, scroll, focused, now, chars, target.over(), touchpad, edges, target.presses());
 
         // How much actually happened this frame. A frame loop that is busy with nothing to do and a frame
         // loop drowning in edges look identical from the outside and are opposite problems; this is the line

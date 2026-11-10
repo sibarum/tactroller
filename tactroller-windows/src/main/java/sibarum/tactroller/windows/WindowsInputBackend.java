@@ -8,6 +8,7 @@ import sibarum.tactroller.api.MouseButton;
 import sibarum.tactroller.api.NativeWindow;
 import sibarum.tactroller.api.PointerDelta;
 import sibarum.tactroller.api.PointerLockMode;
+import sibarum.tactroller.api.PointerTarget;
 import sibarum.tactroller.api.PointerState;
 import sibarum.tactroller.api.ScrollDelta;
 import sibarum.tactroller.api.TouchpadContact;
@@ -634,7 +635,8 @@ public final class WindowsInputBackend implements InputBackend {
      *       answers {@code WM_NCHITTEST} with resize codes inside it, so the client-rect test passes over the
      *       grip. The button is polled, so the press that starts a resize would also be a press on whatever the
      *       GUI drew under the grip — and the resize that follows, a drag across it. The window's own hit-test
-     *       is asked, and a resize band is the window manager's, not the GUI's.</li>
+     *       is asked, and a resize band's <em>press</em> is the window manager's, not the GUI's. Its pointer
+     *       position is still the GUI's ({@link #pointerTarget()}): a grip the GUI draws there lights up under it.</li>
      * </ul>
      *
      * <p>{@code WindowFromPoint} reads the desktop's stacking order, which is global — but it is a
@@ -646,33 +648,47 @@ public final class WindowsInputBackend implements InputBackend {
      * disabled behind a modal dialog is not a scroll target either.
      */
     @Override
-    @SuppressWarnings("restricted")
     public boolean isPointerTarget() {
+        return pointerTarget().presses();
+    }
+
+    /**
+     * {@link #isPointerTarget()}'s three questions, with the third answered as a third outcome rather than a no: over a
+     * resize band, or a resize grip the window draws, the pointer is still over this window, so its position and
+     * motion are delivered (a drawn grip lights up under it), and only a press is withheld, because the window manager
+     * takes it to start the resize.
+     */
+    @Override
+    @SuppressWarnings("restricted")
+    public PointerTarget pointerTarget() {
         long hwnd = attachedHwnd;
         if (hwnd == 0L) {
-            return true;
+            return PointerTarget.CONTENT;
         }
         if (unattended) {
-            return false;
+            return PointerTarget.ELSEWHERE;
         }
         try (Arena a = Arena.ofConfined()) {
             MemorySegment pt = a.allocate(POINT);
             if ((int) getCursorPos.invokeExact(pt) == 0) {
-                return false;
+                return PointerTarget.ELSEWHERE;
             }
             if (!topmostAt(hwnd, pt)) {
-                return false;
+                return PointerTarget.ELSEWHERE;
             }
             int ignored = (int) screenToClient.invokeExact(MemorySegment.ofAddress(hwnd), pt);
             int x = pt.get(JAVA_INT, 0);
             int y = pt.get(JAVA_INT, 4);
             MemorySegment rect = a.allocate(16);   // RECT: left@0, top@4, right@8, bottom@12
             if ((int) getClientRect.invokeExact(MemorySegment.ofAddress(hwnd), rect) == 0) {
-                return false;
+                return PointerTarget.ELSEWHERE;
             }
             boolean inClient = x >= rect.get(JAVA_INT, 0) && x < rect.get(JAVA_INT, 8)
                     && y >= rect.get(JAVA_INT, 4) && y < rect.get(JAVA_INT, 12);
-            return inClient && !inResizeBand(hwnd);
+            if (!inClient) {
+                return PointerTarget.ELSEWHERE;
+            }
+            return inResizeBand(hwnd) ? PointerTarget.WINDOW_MANAGER : PointerTarget.CONTENT;
         } catch (Throwable t) {
             throw wrap("GetClientRect/ScreenToClient failed", t);
         }
