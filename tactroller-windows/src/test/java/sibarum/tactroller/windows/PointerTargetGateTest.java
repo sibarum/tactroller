@@ -3,6 +3,8 @@ package sibarum.tactroller.windows;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledOnOs;
 import org.junit.jupiter.api.condition.OS;
+import sibarum.tactroller.api.InputEdge;
+import sibarum.tactroller.api.MouseButton;
 import sibarum.tactroller.api.NativeWindow;
 
 import java.lang.foreign.Arena;
@@ -77,6 +79,60 @@ class PointerTargetGateTest {
             destroyWindow(over);
             destroyWindow(under);
         }
+    }
+
+    /**
+     * The press is judged by the desktop as it was when the button went down, not as it is when the frame drains it.
+     * Two windows stacked so that their close buttons coincide: a click on the front one closed it, and the back one,
+     * whose frame came round after, found itself uncovered, took the press and the release, and closed too.
+     */
+    @Test
+    @SuppressWarnings("restricted")
+    void aPressOnTheWindowInFrontStaysItsOwnAfterThatWindowCloses() throws Throwable {
+        int[] cursor = cursorPos();
+        long under = createWindow(cursor[0] - SIZE / 2, cursor[1] - SIZE / 2);
+        long over = createWindow(cursor[0] - SIZE / 2, cursor[1] - SIZE / 2);
+        assumeTrue(under != 0L && over != 0L, "could not create test windows (no interactive desktop?)");
+
+        WindowsInputBackend below = new WindowsInputBackend();
+        WindowsInputBackend above = new WindowsInputBackend();
+        try {
+            below.initialize();
+            above.initialize();
+            below.attach(NativeWindow.ofHwnd(under));
+            above.attach(NativeWindow.ofHwnd(over));
+            below.drainEdges();
+            above.drainEdges();
+
+            // One click, fanned to both as the hub fans it, while the front window is up.
+            long t = System.nanoTime();
+            for (WindowsInputBackend b : new WindowsInputBackend[] {above, below}) {
+                b.acceptButton(MouseButton.LEFT, true, cursor[0], cursor[1], t);
+                b.acceptButton(MouseButton.LEFT, false, cursor[0], cursor[1], t + 1);
+            }
+            // The front window acts on its click and closes before the back one's frame.
+            destroyWindow(over);
+            over = 0L;
+
+            assertTrue(pressed(above.drainEdges()), "the window clicked lost its own press");
+            assertFalse(pressed(below.drainEdges()),
+                    "the covered window took a press made on the window over it — one click closes both");
+            assertTrue(below.isPointerTarget(), "the control: uncovered now, the back window is the target again");
+        } finally {
+            above.close();
+            below.close();
+            destroyWindow(over);
+            destroyWindow(under);
+        }
+    }
+
+    private static boolean pressed(java.util.List<InputEdge> edges) {
+        for (InputEdge e : edges) {
+            if (e instanceof InputEdge.ButtonEdge b && b.down()) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** A windowless backend has nothing to be covered by, so it stays the target. */

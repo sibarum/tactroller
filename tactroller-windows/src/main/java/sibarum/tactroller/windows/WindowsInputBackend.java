@@ -239,9 +239,42 @@ public final class WindowsInputBackend implements InputBackend {
     /**
      * Accept one button press or release fanned from {@link WindowsRawInputHub}, the cursor at {@code (x, y)} in
      * screen pixels. Pump thread.
+     *
+     * <p><b>A press another window was drawn over is not queued.</b> Raw input hears every click on the desktop, so
+     * every window of every VexelRay process under the pointer is handed this press; whose it is has to be asked. The
+     * frame asks too ({@link #pointerTarget()}), but it asks when it drains the queue, about the desktop as it is
+     * <em>then</em>. A click on the close button of a window lying over another closed the front one before the back
+     * one's frame came round, and the back one, asked afterwards, was uncovered: it took the press and the release over
+     * its own close button, and one click closed both. Occlusion is the one part of the question another window can
+     * change between the click and the frame, so it is answered here, as the report arrives. A release is always
+     * queued: it can only end a press this window was shown, and the poll settles a press that was never queued.
      */
     void acceptButton(MouseButton button, boolean down, int x, int y, long nanos) {
+        if (down && coveredAt(x, y)) {
+            return;
+        }
         queueEdge(InputEdge.button(button, down, x, y, nanos));
+    }
+
+    /**
+     * Whether another window is what the desktop shows at screen point {@code (x, y)}, over this backend's window.
+     * False with no window attached, as for an unattended one (which drains nothing anyway), and when the question
+     * cannot be asked: a press withheld for a failed query would be a click lost for no reason. Pump thread.
+     */
+    @SuppressWarnings("restricted")
+    private boolean coveredAt(int x, int y) {
+        long hwnd = attachedHwnd;
+        if (hwnd == 0L || unattended) {
+            return false;
+        }
+        try (Arena a = Arena.ofConfined()) {
+            MemorySegment pt = a.allocate(POINT);
+            pt.set(JAVA_INT, 0, x);
+            pt.set(JAVA_INT, 4, y);
+            return !topmostAt(hwnd, pt);
+        } catch (Throwable t) {
+            return false;
+        }
     }
 
     /**
